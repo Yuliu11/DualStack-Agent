@@ -1,0 +1,76 @@
+# RAG Agent 非敏感配置文件
+
+# 重试配置
+retry:
+  max_attempts: 3
+  wait_exponential_multiplier: 1
+  wait_exponential_max: 10
+  stop_after_delay: 30
+
+# 熔断器配置
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout: 60
+  expected_exception: []
+
+# 模型版本配置
+models:
+  # DeepSeek 模型
+  deepseek:
+    chat_model: "deepseek-chat"
+    embedding_model: null  # DeepSeek 暂不支持 embedding
+  
+  # 阿里云百炼模型
+  dashscope:
+    chat_model: "qwen-turbo"
+    embedding_model: "text-embedding-v2"
+  
+  # 默认使用的模型
+  default_chat: "deepseek-chat"
+  default_embedding: "text-embedding-v2"
+
+# 向量存储配置
+vector_store:
+  default: "faiss"
+  faiss:
+    index_path: "./data/faiss_index"
+  qdrant:
+    url: "http://localhost:6333"
+    collection_name: "rag_collection"
+  milvus:
+    host: "localhost"
+    port: 19530
+    collection_name: "rag_collection"
+
+# RAG 检索配置
+retrieval:
+  default_top_k: 5
+  max_top_k: 20
+  rerank_top_k: 10
+  min_score_threshold: 0.5
+  chunk_size: 512
+  chunk_overlap: 50
+  query_rewrite_enabled: true  # 是否启用查询扩写功能
+  multi_route_top_k: 10  # 多路检索中每个查询取Top K个结果
+  rrf_k: 60  # RRF融合算法中的常数k
+  rerank_enabled: false  # 是否启用重排序（需要配置reranker服务）
+  rerank_top_k: 5  # 重排序后返回Top K个结果
+
+# 问答策略配置
+qa_policy:
+  cite_required: true
+  refuse_if_low_conf: true
+  min_confidence: 0.6
+  max_citations: 5
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: null  # null 表示只输出到控制台
+
+# 性能监控配置
+observability:
+  enable_metrics: true
+  enable_tracing: false
+  metrics_port: 9090

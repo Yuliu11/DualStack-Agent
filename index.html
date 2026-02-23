@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG 智能问答系统</title>
+    
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    
+    <!-- Element Plus -->
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <script src="https://unpkg.com/element-plus/dist/index.full.js"></script>
+    <script src="https://unpkg.com/element-plus/dist/locale/zh-cn.js"></script>
+    
+    <!-- Element Plus Icons -->
+    <script src="https://unpkg.com/@element-plus/icons-vue/dist/index.iife.js"></script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background-color: #f5f5f5;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .app-container {
+            display: flex;
+            height: 100vh;
+            width: 100%;
+        }
+        
+        /* 左侧文档列表 */
+        .sidebar {
+            width: 280px;
+            background-color: #ffffff;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 2px 0 8px rgba(0, 0, 0, 0.05);
+        }
+        
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid #e0e0e0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .sidebar-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+        
+        .sidebar-header p {
+            font-size: 12px;
+            opacity: 0.9;
+        }
+        
+        .document-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+        
+        .document-item {
+            padding: 12px 15px;
+            margin-bottom: 8px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+        
+        .document-item:hover {
+            background-color: #e9ecef;
+            border-color: #667eea;
+        }
+        
+        .document-item.active {
+            background-color: #e7edff;
+            border-color: #667eea;
+        }
+        
+        .document-title {
+            font-size: 14px;
+            font-weight: 500;
+            color: #333;
+            margin-bottom: 4px;
+        }
+        
+        .document-meta {
+            font-size: 12px;
+            color: #666;
+        }
+        
+        /* 中间聊天区域 */
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: #ffffff;
+        }
+        
+        .chat-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #e0e0e0;
+            background-color: #ffffff;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
+        }
+        
+        .chat-header h3 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .chat-header p {
+            font-size: 13px;
+            color: #666;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            background-color: #f5f5f5;
+        }
+        
+        .message {
+            display: flex;
+            margin-bottom: 24px;
+            animation: fadeIn 0.3s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .message.user {
+            justify-content: flex-end;
+        }
+        
+        .message.assistant {
+            justify-content: flex-start;
+        }
+        
+        .message-content {
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            line-height: 1.6;
+            word-wrap: break-word;
+        }
+        
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        
+        .message.assistant .message-content {
+            background-color: #ffffff;
+            color: #333;
+            border: 1px solid #e0e0e0;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+        
+        .message-text {
+            font-size: 14px;
+            white-space: pre-wrap;
+        }
+        
+        .citations {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #e0e0e0;
+        }
+        
+        .citations-title {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        
+        .citation-item {
+            display: inline-block;
+            margin-right: 8px;
+            margin-bottom: 6px;
+            padding: 4px 10px;
+            background-color: #f0f4ff;
+            color: #667eea;
+            border-radius: 12px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid #d0d9ff;
+        }
+        
+        .citation-item:hover {
+            background-color: #e0e9ff;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 4px rgba(102, 126, 234, 0.2);
+        }
+        
+        .loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .chat-input-container {
+            padding: 20px 24px;
+            background-color: #ffffff;
+            border-top: 1px solid #e0e0e0;
+            box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.02);
+        }
+        
+        .input-wrapper {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+        
+        .input-textarea {
+            flex: 1;
+        }
+        
+        .send-button {
+            height: 40px;
+            padding: 0 24px;
+        }
+        
+        /* 引用弹窗 */
+        .citation-dialog .citation-content {
+            max-height: 400px;
+            overflow-y: auto;
+            padding: 16px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            margin-top: 12px;
+        }
+        
+        .citation-text {
+            font-size: 14px;
+            line-height: 1.8;
+            color: #333;
+            white-space: pre-wrap;
+        }
+        
+        .citation-meta {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #e0e0e0;
+        }
+        
+        /* 空状态 */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #999;
+        }
+        
+        .empty-state-icon {
+            font-size: 64px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+        
+        .empty-state-text {
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="app-container">
+            <!-- 左侧文档列表 -->
+            <div class="sidebar">
+                <div class="sidebar-header">
+                    <h2>📚 文档库</h2>
+                    <p>{{ documents.length }} 个文档已加载</p>
+                </div>
+                <div class="document-list">
+                    <div 
+                        v-for="doc in documents" 
+                        :key="doc.id"
+                        :class="['document-item', { active: selectedDocId === doc.id }]"
+                        @click="selectDocument(doc.id)"
+                    >
+                        <div class="document-title">{{ doc.title }}</div>
+                        <div class="document-meta">
+                            {{ doc.chunks_count || 0 }} 个片段 · {{ formatDate(doc.created_at) }}
+                        </div>
+                    </div>
+                    <div v-if="documents.length === 0" style="padding: 20px; text-align: center; color: #999;">
+                        暂无文档
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 中间聊天区域 -->
+            <div class="chat-container">
+                <div class="chat-header">
+                    <h3>💬 智能问答</h3>
+                    <p>基于 RAG 技术的文档问答系统</p>
+                </div>
+                
+                <div class="chat-messages" ref="messagesContainer">
+                    <div v-if="messages.length === 0" class="empty-state">
+                        <div class="empty-state-icon">🤖</div>
+                        <div class="empty-state-text">开始提问吧，我会基于文档内容为您解答</div>
+                    </div>
+                    
+                    <div 
+                        v-for="(message, index) in messages" 
+                        :key="index"
+                        :class="['message', message.role]"
+                    >
+                        <div class="message-content">
+                            <div class="message-text">{{ message.content }}</div>
+                            
+                            <!-- 引用来源 -->
+                            <div v-if="message.citations && message.citations.length > 0" class="citations">
+                                <div class="citations-title">📎 参考来源：</div>
+                                <span 
+                                    v-for="(citation, idx) in message.citations" 
+                                    :key="idx"
+                                    class="citation-item"
+                                    @click="showCitation(citation)"
+                                >
+                                    [{{ idx + 1 }}] Chunk {{ citation.chunk_id }}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 加载中 -->
+                    <div v-if="loading" class="message assistant">
+                        <div class="message-content">
+                            <div class="loading">
+                                <el-icon class="is-loading"><Loading /></el-icon>
+                                <span>正在思考中...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="chat-input-container">
+                    <div class="input-wrapper">
+                        <el-input
+                            v-model="inputMessage"
+                            type="textarea"
+                            :rows="3"
+                            placeholder="请输入您的问题..."
+                            class="input-textarea"
+                            @keydown.ctrl.enter="sendMessage"
+                            :disabled="loading"
+                        />
+                        <el-button 
+                            type="primary" 
+                            class="send-button"
+                            @click="sendMessage"
+                            :loading="loading"
+                            :disabled="!inputMessage.trim() || loading"
+                        >
+                            <el-icon><Promotion /></el-icon>
+                            发送
+                        </el-button>
+                    </div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #999;">
+                        💡 提示：按 Ctrl + Enter 快速发送
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 引用详情弹窗 -->
+        <el-dialog
+            v-model="citationDialogVisible"
+            title="引用来源详情"
+            width="600px"
+            class="citation-dialog"
+        >
+            <div v-if="selectedCitation">
+                <div class="citation-content">
+                    <div class="citation-text">{{ selectedCitation.content || selectedCitation.text }}</div>
+                </div>
+                <div class="citation-meta">
+                    <div>Chunk ID: {{ selectedCitation.chunk_id }}</div>
+                    <div v-if="selectedCitation.document_id">文档 ID: {{ selectedCitation.document_id }}</div>
+                    <div v-if="selectedCitation.score">相似度: {{ (selectedCitation.score * 100).toFixed(2) }}%</div>
+                </div>
+            </div>
+        </el-dialog>
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+        const { ElMessage } = ElementPlus;
+
+        // API 配置
+        const API_BASE_URL = 'http://localhost:8000';
+
+        createApp({
+            data() {
+                return {
+                    inputMessage: '',
+                    messages: [],
+                    loading: false,
+                    documents: [],
+                    selectedDocId: null,
+                    citationDialogVisible: false,
+                    selectedCitation: null
+                };
+            },
+            mounted() {
+                this.loadDocuments();
+            },
+            methods: {
+                async loadDocuments() {
+                    try {
+                        // 这里可以调用 API 获取文档列表，暂时使用模拟数据
+                        // 实际项目中可以添加 GET /documents 接口
+                        this.documents = [
+                            { id: 1, title: '示例文档 1', chunks_count: 10, created_at: new Date() },
+                            { id: 2, title: '示例文档 2', chunks_count: 15, created_at: new Date() }
+                        ];
+                    } catch (error) {
+                        console.error('加载文档列表失败:', error);
+                    }
+                },
+                
+                selectDocument(docId) {
+                    this.selectedDocId = docId;
+                },
+                
+                async sendMessage() {
+                    if (!this.inputMessage.trim() || this.loading) {
+                        return;
+                    }
+                    
+                    const userMessage = this.inputMessage.trim();
+                    this.inputMessage = '';
+                    
+                    // 添加用户消息
+                    this.messages.push({
+                        role: 'user',
+                        content: userMessage,
+                        citations: []
+                    });
+                    
+                    // 滚动到底部
+                    this.$nextTick(() => {
+                        this.scrollToBottom();
+                    });
+                    
+                    // 发送请求
+                    this.loading = true;
+                    
+                    try {
+                        const response = await fetch(`${API_BASE_URL}/chat`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                query: userMessage,
+                                tenant_id: 0,
+                                user_id: null,
+                                top_k: null
+                            })
+                        });
+                        
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        
+                        const data = await response.json();
+                        
+                        // 添加助手回复
+                        const citations = (data.citations || []).map(cit => ({
+                            chunk_id: cit.chunk_id,
+                            content: cit.content_preview || cit.content || '',
+                            document_id: cit.document_id,
+                            page_start: cit.page_start,
+                            page_end: cit.page_end,
+                            section_path: cit.section_path,
+                            score: cit.score
+                        }));
+                        
+                        this.messages.push({
+                            role: 'assistant',
+                            content: data.answer || data.message || '抱歉，我无法回答这个问题。',
+                            citations: citations
+                        });
+                        
+                    } catch (error) {
+                        console.error('发送消息失败:', error);
+                        ElMessage.error('发送消息失败，请检查网络连接或服务器状态');
+                        
+                        // 添加错误消息
+                        this.messages.push({
+                            role: 'assistant',
+                            content: '抱歉，发生了错误。请稍后重试。',
+                            citations: []
+                        });
+                    } finally {
+                        this.loading = false;
+                        this.$nextTick(() => {
+                            this.scrollToBottom();
+                        });
+                    }
+                },
+                
+                scrollToBottom() {
+                    const container = this.$refs.messagesContainer;
+                    if (container) {
+                        container.scrollTop = container.scrollHeight;
+                    }
+                },
+                
+                showCitation(citation) {
+                    this.selectedCitation = citation;
+                    this.citationDialogVisible = true;
+                },
+                
+                formatDate(date) {
+                    if (!date) return '';
+                    const d = new Date(date);
+                    return d.toLocaleDateString('zh-CN', {
+                        year: 'numeric',
+                        month: 'short',
+                        day: 'numeric'
+                    });
+                }
+            }
+        })
+        .use(ElementPlus, { locale: ElementPlusLocaleZhCn })
+        .mount('#app');
+    </script>
+</body>
+</html>

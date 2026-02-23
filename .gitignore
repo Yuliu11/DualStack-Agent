@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境变量和敏感配置
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.cert
+
+# 数据库数据
+mysql_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志文件
+*.log
+logs/
+
+# 上传的文件
+uploads/
+data/raw/*.pdf
+data/raw/*.txt
+data/raw/*.doc
+data/raw/*.docx
+
+# 确保 PDF 文件不被上传（更严格的匹配）
+*.pdf
+!docs/*.png
+
+# 向量索引文件（可选，如果不想上传索引文件，取消下面的注释）
+# data/faiss_index
+# data/faiss_index.mapping
+
+# 临时文件
+*.tmp
+*.temp
+.cache/
+
+# 操作系统
+Thumbs.db
+.DS_Store
+
+# 项目特定
+*.md.bak
+FINAL_CLEANUP_SUMMARY.md
+FIXES_SUMMARY.md
+FOREIGN_KEY_FIX_SUMMARY.md
+HYBRID_SEARCH_IMPLEMENTATION.md
+INDEX_BUILD_IMPLEMENTATION.md
+INDEX_BUILD_STATUS.md
+PARAMETER_CLEANUP_SUMMARY.md
+PROMPT_CONFIG_REFACTOR.md
+REQUIREMENTS_CHECK.md
