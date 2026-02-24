@@ -30,20 +30,27 @@ except ImportError:
 class VectorStore:
     """向量存储管理器"""
     
-    def __init__(self, vector_store_type: str = "faiss", index_path: Optional[str] = None):
+    def __init__(
+        self,
+        vector_store_type: str = "faiss",
+        index_path: Optional[str] = None,
+        read_only: bool = True,
+    ):
         """
-        初始化向量存储
-        
+        初始化向量存储。
+
         Args:
             vector_store_type: 向量存储类型 ("faiss" 或 "qdrant")
-            index_path: FAISS索引文件路径（仅用于FAISS）
+            index_path: FAISS 索引文件路径（仅用于 FAISS）
+            read_only: 若为 True（默认），仅允许搜索，不允许 add_vectors/save_index（问答模式）
         """
         self.vector_store_type = vector_store_type
         self.index_path = index_path or "./data/faiss_index"
+        self.read_only = read_only
         self.index = None
         self.id_to_chunk = {}  # vector_id -> chunk_id 映射
         self.chunk_to_id = {}  # chunk_id -> vector_id 映射
-        
+
         if vector_store_type == "faiss" and FAISS_AVAILABLE:
             self._load_faiss_index()
         elif vector_store_type == "qdrant" and QDRANT_AVAILABLE:
@@ -213,13 +220,11 @@ class VectorStore:
         vector_ids: Optional[List[str]] = None
     ):
         """
-        添加向量到索引（仅用于FAISS和内存存储）
-        
-        Args:
-            vectors: 向量列表
-            chunk_ids: 对应的chunk ID列表
-            vector_ids: 可选的向量ID列表
+        添加向量到索引（仅用于 FAISS 和内存存储）。read_only 时为 no-op。
         """
+        if self.read_only:
+            logger.warning("VectorStore 处于只读模式，跳过 add_vectors")
+            return
         if self.vector_store_type == "faiss":
             self._add_to_faiss(vectors, chunk_ids, vector_ids)
         elif self.vector_store_type == "memory":
@@ -266,7 +271,10 @@ class VectorStore:
             self.vector_dim = len(vectors[0])
     
     def save_index(self):
-        """保存索引（仅用于FAISS）"""
+        """保存索引（仅用于 FAISS）。read_only 时为 no-op。"""
+        if self.read_only:
+            logger.warning("VectorStore 处于只读模式，跳过 save_index")
+            return
         if self.vector_store_type == "faiss" and self.index is not None:
             try:
                 index_file = Path(self.index_path)

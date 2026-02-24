@@ -2,6 +2,7 @@
 FastAPI 主入口
 提供文档摄取和问答接口
 """
+import json
 import os
 import logging
 from typing import Optional
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from contextlib import asynccontextmanager
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -27,63 +28,24 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    # 启动时执行
-    import asyncio
-    
-    # 初始化向量库
+    """应用生命周期管理。问答服务不自动扫描或摄取文档，文档入库请使用 scripts/import_docs.py 或 /ingest 接口。"""
+    # 启动时仅初始化向量库（只读，用于检索）
     try:
         from app.retrieval.engine import RetrievalEngine
         retrieval_engine = RetrievalEngine()
-        # 触发向量库初始化（如果使用 FAISS，会尝试加载索引）
         if retrieval_engine.vector_store.vector_store_type == "faiss":
             index_path = retrieval_engine.vector_store.index_path
             index_file = Path(index_path)
             if not index_file.exists():
                 logger.warning(
-                    f"FAISS 索引文件不存在: {index_file.absolute()}. "
-                    f"请运行 ingest_local.py 或上传文档以创建索引。"
+                    "FAISS 索引文件不存在: %s。请使用 scripts/import_docs.py 或 /ingest 接口导入文档后构建索引。",
+                    index_file.absolute(),
                 )
             else:
-                logger.info(f"向量库初始化完成: {index_file.absolute()}")
+                logger.info("向量库初始化完成（只读）: %s", index_file.absolute())
     except Exception as e:
-        logger.error(f"向量库初始化失败: {e}", exc_info=True)
-    
-    # 获取 data/raw 文件夹路径
-    raw_folder = Path("./data/raw")
-    
-    if raw_folder.exists() and raw_folder.is_dir():
-        logger.info(f"启动时自动扫描文件夹: {raw_folder.absolute()}")
-        
-        # 在后台任务中执行扫描，避免阻塞启动
-        async def scan_folder():
-            try:
-                result = await document_pipeline.process_local_folder(
-                    folder_path=str(raw_folder.absolute()),
-                    tenant_id=0,
-                    doc_type="annual_report",
-                    source="auto_scan"
-                )
-                
-                if result.get('success'):
-                    logger.info(
-                        f"自动扫描完成: 处理 {result.get('processed', 0)} 个文件, "
-                        f"跳过 {result.get('skipped', 0)} 个文件, "
-                        f"失败 {result.get('failed', 0)} 个文件"
-                    )
-                else:
-                    logger.warning(f"自动扫描失败: {result.get('error')}")
-            except Exception as e:
-                logger.error(f"自动扫描时发生错误: {e}", exc_info=True)
-        
-        # 启动后台任务
-        asyncio.create_task(scan_folder())
-    else:
-        logger.info(f"data/raw 文件夹不存在，跳过自动扫描: {raw_folder.absolute()}")
-    
-    yield  # 应用运行中
-    
-    # 关闭时执行（如果需要）
+        logger.error("向量库初始化失败: %s", e, exc_info=True)
+    yield
     pass
 
 
@@ -121,6 +83,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     """聊天响应模型"""
     success: bool
+    task_id: Optional[str] = None
+    status: Optional[str] = None
     request_id: Optional[int] = None
     answer: str
     confidence: float
@@ -288,14 +252,37 @@ async def chat(
     """
     try:
         logger.info(f"收到查询: {request.query[:50]}...")
-        
-        # 调用 RAG 服务
-        result = await rag_service.query(
+
+        # 幂等调用：同一 user_id + query 去重执行
+        idem = await rag_service.query_idempotent(
             query=request.query,
             tenant_id=request.tenant_id,
             user_id=request.user_id,
-            top_k=request.top_k
+            top_k=request.top_k,
         )
+        task_id = idem.get("task_id")
+        status = idem.get("status")
+
+        if status == "PENDING":
+            pending_resp = ChatResponse(
+                success=True,
+                task_id=task_id,
+                status="PENDING",
+                request_id=None,
+                answer="请求正在处理中，请稍候",
+                confidence=0.0,
+                is_refused=False,
+                model_name=None,
+                citations=[],
+                retrieved_chunks_count=0,
+                cited_chunks_count=0,
+                latency_ms=0,
+                error=None,
+            )
+            return JSONResponse(status_code=202, content=pending_resp.dict())
+
+        # SUCCESS / 其他：拿到结果（SUCCESS 会走缓存或真实执行）
+        result = idem.get("result") or {}
         
         # 确保 result 包含所有必需字段
         if not isinstance(result, dict):
@@ -313,6 +300,8 @@ async def chat(
         # 构建完整的响应，确保所有字段都有默认值
         return ChatResponse(
             success=result.get('success', False),
+            task_id=task_id,
+            status=status,
             request_id=result.get('request_id'),
             answer=result.get('answer', ''),
             confidence=result.get('confidence', 0.0),
@@ -378,6 +367,51 @@ async def chat(
         )
 
 
+def _sse_message(event: str, data: str) -> str:
+    """格式化为 SSE 单条消息：event + data + 双换行。"""
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+async def _chat_stream_generator(request: ChatRequest):
+    """流式生成 SSE 消息。"""
+    try:
+        async for item in rag_service.query_stream(
+            query=request.query,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            top_k=request.top_k,
+        ):
+            event = item.get("event", "message")
+            raw = item.get("data")
+            if isinstance(raw, (dict, list)):
+                data = json.dumps(raw, ensure_ascii=False)
+            else:
+                data = json.dumps(raw, ensure_ascii=False) if raw is not None else ""
+            yield _sse_message(event, data)
+    except Exception as e:
+        logger.exception("流式问答异常: %s", e)
+        yield _sse_message("error", json.dumps({"error": str(e)}, ensure_ascii=False))
+
+
+# 流式问答接口（SSE）
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """
+    流式问答：先返回引用来源（citations），再逐块返回生成的答案内容。
+    幂等：若缓存中已有 SUCCESS 结果，则直接一次性返回该结果。
+    返回格式符合 Server-Sent Events (SSE)。
+    """
+    return StreamingResponse(
+        _chat_stream_generator(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # 根路径
 @app.get("/")
 async def root():
@@ -388,7 +422,8 @@ async def root():
         "endpoints": {
             "health": "/health",
             "ingest": "/ingest",
-            "chat": "/chat"
+            "chat": "/chat",
+            "chat_stream": "/chat/stream"
         }
     }
 

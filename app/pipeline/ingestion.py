@@ -2,6 +2,7 @@
 文档摄取流水线
 整合解析、清洗、切分、增量更新和持久化
 """
+import os
 import re
 import hashlib
 import json
@@ -41,13 +42,14 @@ class DocumentIngestionPipeline:
         )
         self.default_tenant_id = 0
         
-        # 初始化向量存储（用于索引构建）
+        # 初始化向量存储（解析/摄取模式：允许写入索引）
         vector_config = yaml_config.get("vector_store", {})
         vector_store_type = vector_config.get("default", "faiss")
         index_path = vector_config.get("faiss", {}).get("index_path", "./data/faiss_index")
         self.vector_store = VectorStore(
             vector_store_type=vector_store_type,
-            index_path=index_path
+            index_path=index_path,
+            read_only=False,
         )
     
     def calculate_content_hash(self, content: str) -> str:
@@ -562,12 +564,11 @@ class DocumentIngestionPipeline:
                         continue
                 continue
             
-            # 生成新向量
+            # 生成新向量（失败时跳过该 chunk，不中断整条流水线）
             embedding = await self._generate_embedding(chunk.content, embed_model)
-            
             if embedding is None:
                 failed_count += 1
-                logger.warning(f"Chunk {chunk.id}: 生成向量失败")
+                logger.error("Chunk %s: _generate_embedding 返回 None，跳过该 chunk", chunk.id)
                 continue
             
             # 准备添加到索引
@@ -591,24 +592,16 @@ class DocumentIngestionPipeline:
             embeddings_to_save.append(embedding_record)
             processed_count += 1
         
-        # 批量添加到向量索引（先添加到索引，再保存到数据库，确保一致性）
+        # 批量添加到向量索引（先添加到索引，再统一保存一次）
         if vectors_to_add:
             try:
                 self.vector_store.add_vectors(
                     vectors=vectors_to_add,
                     chunk_ids=chunk_ids_to_add,
-                    vector_ids=[f"faiss_{cid}" if self.vector_store.vector_store_type == "faiss" else f"qdrant_{cid}" 
+                    vector_ids=[f"faiss_{cid}" if self.vector_store.vector_store_type == "faiss" else f"qdrant_{cid}"
                                for cid in chunk_ids_to_add]
                 )
-                logger.info(f"已添加 {len(vectors_to_add)} 个向量到索引")
-                
-                # 添加成功后，立即保存索引（部分保存，避免中断丢失）
-                if self.vector_store.vector_store_type == "faiss":
-                    try:
-                        self.vector_store.save_index()
-                        logger.debug("已保存部分索引到文件（增量保存）")
-                    except Exception as save_error:
-                        logger.warning(f"增量保存索引失败: {save_error}，将在最后统一保存")
+                logger.info("已添加 %d 个向量到索引", len(vectors_to_add))
             except Exception as e:
                 logger.error(f"添加向量到索引失败: {e}", exc_info=True)
                 # 索引添加失败，标记这些向量为失败
@@ -627,9 +620,9 @@ class DocumentIngestionPipeline:
                 for emb in embeddings_to_save:
                     session.add(emb)
                 await session.flush()
-                logger.info(f"已保存 {len(embeddings_to_save)} 个向量元数据到数据库")
+                logger.info("已保存 %d 个向量元数据到数据库", len(embeddings_to_save))
             except Exception as e:
-                logger.error(f"保存向量元数据失败: {e}", exc_info=True)
+                logger.error("保存向量元数据失败: %s", e, exc_info=True)
                 await session.rollback()
                 return {
                     'success': False,
@@ -638,7 +631,15 @@ class DocumentIngestionPipeline:
                     'skipped': skipped_count,
                     'error': str(e)
                 }
-        
+
+        # 仅在所有向量成功添加后执行一次索引落盘
+        if vectors_to_add and self.vector_store.vector_store_type == "faiss":
+            try:
+                self.vector_store.save_index()
+                logger.info("索引已保存到文件")
+            except Exception as save_err:
+                logger.error("保存索引失败: %s", save_err, exc_info=True)
+
         return {
             'success': True,
             'processed': processed_count,
@@ -660,99 +661,71 @@ class DocumentIngestionPipeline:
         version_tag: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        摄取 PDF 文档的主流程
-        
-        Returns:
-            处理结果字典
+        摄取 PDF 文档的主流程。幂等：相同 file_sha256 且已解析则直接返回，不调用解析。
+        分三阶段提交：创建/获取文档 -> 生成切片 -> 构建索引。
         """
         document = None
         file_sha256 = None
-        parsed_pdf = None
-        
+
         try:
-            # 两级校验：第一级 - 文档级 file_sha256 校验
+            # ---------- 强制前置校验：在进入任何 pdf_parser 解析逻辑之前，先计算 file_sha256 并查库 ----------
             file_sha256 = self.parser.calculate_file_hash(file_path)
-            logger.info(f"开始处理文档 (file_sha256={file_sha256[:16]}...)")
-            
-            # 检查文档是否已存在
+            logger.info("开始处理文档 (file_sha256=%s...)", file_sha256[:16])
+
             async with db_manager.get_session() as session:
                 existing_doc = await self.check_document_exists(session, tenant_id, file_sha256)
-                
-                if existing_doc:
+                if existing_doc and getattr(existing_doc, "parse_status", None) == "parsed":
                     logger.info(
-                        f"文档已存在 (file_sha256={file_sha256[:16]}...), "
-                        f"文档ID={existing_doc.id}, 状态={existing_doc.parse_status}"
+                        "[Ingest] 文档已存在且已解析，跳过处理: file_sha256=%s..., document_id=%s",
+                        file_sha256[:16], existing_doc.id,
                     )
-                    # 如果文档已存在且已解析，可以直接返回
-                    if existing_doc.parse_status == "parsed":
-                        return {
-                            'success': True,
-                            'document_id': existing_doc.id,
-                            'message': '文档已存在且已解析，跳过处理',
-                            'file_sha256': file_sha256,
-                            'chunks_count': 0,
-                            'reused_chunks_count': 0,
-                            'new_chunks_count': 0,
-                            'reusable_embeddings_count': 0
-                        }
-                    # 如果文档存在但未解析，继续处理
-                    document = existing_doc
-                else:
-                    # 文档不存在，需要解析
-                    document = None
-            
-            # 两级校验：第二级 - 若文档不存在或未解析，进入 Chunk 切分流程
-            if document is None or document.parse_status != "parsed":
-                # 1. 解析 PDF（混合提取文本和表格）
-                parsed_pdf = await self.parser.parse_pdf(file_path, extract_tables=True)
-                
-                # 验证文件哈希是否一致
-                if parsed_pdf.file_sha256 != file_sha256:
-                    raise ValueError(
-                        f"文件哈希不一致: 计算值={file_sha256}, "
-                        f"解析值={parsed_pdf.file_sha256}"
-                    )
-                
-                # 2. 提取标题
-                if not title:
-                    title = parsed_pdf.title or Path(file_path).stem
-                
-                # 3. 创建文档记录（解析开始时）
-                async with db_manager.get_session() as session:
-                    document = await self.create_document(
-                        session,
-                        file_uri=file_path,
-                        file_sha256=parsed_pdf.file_sha256,
-                        file_size=parsed_pdf.file_size,
-                        title=title,
-                        tenant_id=tenant_id,
-                        doc_type=doc_type,
-                        source=source,
-                        company_name=company_name,
-                        stock_code=stock_code,
-                        year=year,
-                        report_date=report_date
-                    )
-                    await session.commit()
-            
-            # 4. 处理每页：合并文本和表格元素（仅在需要解析时执行）
-            if parsed_pdf is None:
-                # 如果文档已存在且已解析，不需要重新处理
-                return {
-                    'success': True,
-                    'document_id': document.id,
-                    'message': '文档已存在且已解析，跳过处理',
-                    'file_sha256': file_sha256,
-                    'chunks_count': 0,
-                    'reused_chunks_count': 0,
-                    'new_chunks_count': 0,
-                    'reusable_embeddings_count': 0
-                }
-            
-            # 继续处理（需要解析 PDF）
+                    return {
+                        "success": True,
+                        "document_id": existing_doc.id,
+                        "message": "文档已存在且已解析，跳过处理",
+                        "file_sha256": file_sha256,
+                        "chunks_count": 0,
+                        "reused_chunks_count": 0,
+                        "new_chunks_count": 0,
+                        "reusable_embeddings_count": 0,
+                    }
+
+            # ---------- 阶段一：创建/获取文档 ----------
+            file_size = 0
+            try:
+                file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            except Exception:
+                pass
+            title_initial = title or Path(file_path).stem
+
+            async with db_manager.get_session() as session:
+                document = await self.create_document(
+                    session,
+                    file_uri=file_path,
+                    file_sha256=file_sha256,
+                    file_size=file_size,
+                    title=title_initial,
+                    tenant_id=tenant_id,
+                    doc_type=doc_type,
+                    source=source,
+                    company_name=company_name,
+                    stock_code=stock_code,
+                    year=year,
+                    report_date=report_date,
+                )
+                await session.commit()
+
+            # ---------- 阶段二：解析、生成切片并持久化 ----------
+            parsed_pdf = await self.parser.parse_pdf(file_path, extract_tables=True)
+            if parsed_pdf.file_sha256 != file_sha256:
+                raise ValueError(
+                    "文件哈希不一致: 计算值=%s, 解析值=%s"
+                    % (file_sha256, parsed_pdf.file_sha256)
+                )
+            title = title or parsed_pdf.title or Path(file_path).stem
+
             all_elements = []
             all_tables = []
-            
             for page_elements in parsed_pdf.pages:
                 # 清洗文本元素
                 cleaned_text_elements = []
@@ -787,123 +760,121 @@ class DocumentIngestionPipeline:
             # 5. 切分（段落优先，使用 RecursiveCharacterTextSplitter 逻辑）
             chunks_data = self.chunker.split_elements(all_elements)
             
-            # 6. 持久化到数据库
+            # 6. 持久化到数据库（阶段二）
             async with db_manager.get_session() as session:
+                doc_id = document.id
                 # 确定版本号
                 stmt = select(DocVersion.version_no).where(
-                    DocVersion.document_id == document.id
+                    DocVersion.document_id == doc_id
                 ).order_by(DocVersion.version_no.desc()).limit(1)
                 result = await session.execute(stmt)
                 max_version = result.scalar_one_or_none()
                 version_no = (max_version or 0) + 1
-                
-                # 计算整体内容哈希
-                all_content = "\n".join([c['content'] for c in chunks_data])
+
+                all_content = "\n".join([c["content"] for c in chunks_data])
                 content_sha256 = self.calculate_content_hash(all_content)
-                
-                # 创建文档版本
+
                 version = await self.create_document_version(
                     session,
-                    document_id=document.id,
+                    document_id=doc_id,
                     version_no=version_no,
                     content_sha256=content_sha256,
                     tenant_id=tenant_id,
-                    version_tag=version_tag
+                    version_tag=version_tag,
                 )
-                
-                # 处理表格
-                table_id_map = {}  # table_id -> markdown_content
+
+                table_id_map = {}
                 for table_info in all_tables:
                     table_obj, markdown_content = await self.process_table(
                         session,
-                        table_info['data'],
-                        document_id=document.id,
+                        table_info["data"],
+                        document_id=doc_id,
                         version_id=version.id,
-                        page_no=table_info['page_no'],
-                        tenant_id=tenant_id
+                        page_no=table_info["page_no"],
+                        tenant_id=tenant_id,
                     )
                     table_id_map[table_obj.id] = markdown_content
-                
-                # 关联表格到 chunks
+
                 for chunk_data in chunks_data:
-                    if chunk_data.get('is_table') and chunk_data.get('table_data'):
-                        # 查找对应的 table_id
-                        table_sha256 = self.calculate_content_hash(
-                            json.dumps(chunk_data['table_data'], ensure_ascii=False, sort_keys=True)
-                        )
-                        # 通过 table_sha256 查找 table_id
-                        for table_id, markdown in table_id_map.items():
-                            # 简化：直接使用第一个匹配的表格
-                            # 实际应该通过 table_sha256 精确匹配
-                            chunk_data['table_id'] = table_id
+                    if chunk_data.get("is_table") and chunk_data.get("table_data"):
+                        for table_id in table_id_map:
+                            chunk_data["table_id"] = table_id
                             break
-                
-                # 批量处理 chunks
-                # 获取嵌入模型配置
+
                 embed_model = yaml_config.get("models", {}).get("default_embedding", "text-embedding-v2")
-                
                 chunks, reused_chunk_count, new_chunk_count, reusable_embedding_count = await self.process_chunks_batch(
                     session,
                     chunks_data,
-                    document_id=document.id,
+                    document_id=doc_id,
                     version_id=version.id,
                     tenant_id=tenant_id,
-                    embed_model=embed_model
+                    embed_model=embed_model,
                 )
-                
-                # 更新文档状态为成功
-                document.parse_status = "parsed"
-                document.parse_error = None
-                document.current_version_id = version.id
-                
+
+                # 在本 session 内重新加载并更新文档状态
+                doc_stmt = select(Document).where(Document.id == doc_id).limit(1)
+                doc_result = await session.execute(doc_stmt)
+                doc_row = doc_result.scalar_one_or_none()
+                if doc_row:
+                    doc_row.parse_status = "parsed"
+                    doc_row.parse_error = None
+                    doc_row.current_version_id = version.id
+
                 await session.commit()
-                
-                # 7. 构建向量索引（在 chunks 保存后）
-                index_build_result = None
+            # 阶段二结束（一次 commit）
+
+            # ---------- 阶段三：构建向量索引（独立 session，一次 commit） ----------
+            embed_model = yaml_config.get("models", {}).get("default_embedding", "text-embedding-v2")
+            index_build_result = None
+            async with db_manager.get_session() as session:
+                # 重新加载 chunks（新 session）
+                stmt = select(Chunk).where(
+                    and_(
+                        Chunk.document_id == document.id,
+                        Chunk.is_deleted == False,
+                    )
+                )
+                result = await session.execute(stmt)
+                chunks = list(result.scalars().all())
                 try:
-                    # 为所有 chunks 构建索引（内部会检查是否已存在）
                     index_build_result = await self.build_index_for_chunks(
                         session,
                         chunks,
                         embed_model,
                         tenant_id,
-                        document.id
+                        document.id,
                     )
-                    
-                    # 提交向量元数据
                     await session.commit()
-                    
                     logger.info(
-                        f"索引构建完成: 处理 {index_build_result.get('processed', 0)} 个, "
-                        f"跳过 {index_build_result.get('skipped', 0)} 个, "
-                        f"失败 {index_build_result.get('failed', 0)} 个"
+                        "索引构建完成: 处理 %s 个, 跳过 %s 个, 失败 %s 个",
+                        index_build_result.get("processed", 0),
+                        index_build_result.get("skipped", 0),
+                        index_build_result.get("failed", 0),
                     )
                 except Exception as e:
-                    logger.error(f"索引构建失败: {e}", exc_info=True)
+                    logger.error("索引构建失败: %s", e, exc_info=True)
                     await session.rollback()
-                    # 索引构建失败不影响文档摄取成功，但记录错误
-                    index_build_result = {'success': False, 'error': str(e)}
-                    # 尝试保存已生成的索引（部分保存）
+                    index_build_result = {"success": False, "error": str(e)}
                     try:
                         if self.vector_store.vector_store_type == "faiss":
                             self.vector_store.save_index()
                             logger.info("已保存部分索引到文件")
                     except Exception as save_error:
-                        logger.error(f"保存部分索引失败: {save_error}")
-                
-                return {
-                    'success': True,
-                    'document_id': document.id,
-                    'version_id': version.id,
-                    'version_no': version_no,
-                    'chunks_count': len(chunks),
-                    'reused_chunks_count': reused_chunk_count,
-                    'new_chunks_count': new_chunk_count,
-                    'reusable_embeddings_count': reusable_embedding_count,
-                    'tables_count': len(all_tables),
-                    'file_sha256': parsed_pdf.file_sha256,
-                    'index_build': index_build_result
-                }
+                        logger.error("保存部分索引失败: %s", save_error)
+
+            return {
+                "success": True,
+                "document_id": doc_id,
+                "version_id": version.id,
+                "version_no": version_no,
+                "chunks_count": len(chunks),
+                "reused_chunks_count": reused_chunk_count,
+                "new_chunks_count": new_chunk_count,
+                "reusable_embeddings_count": reusable_embedding_count,
+                "tables_count": len(all_tables),
+                "file_sha256": parsed_pdf.file_sha256,
+                "index_build": index_build_result,
+            }
         
         except Exception as e:
             # 异常捕获：删除失败的文档记录，避免残留
