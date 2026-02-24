@@ -367,14 +367,18 @@ async def chat(
         )
 
 
-def _sse_message(event: str, data: str) -> str:
-    """格式化为 SSE 单条消息：event + data + 双换行。"""
-    return f"event: {event}\ndata: {data}\n\n"
+def _sse_line(payload: dict) -> bytes:
+    """SSE 单条消息，标准格式：data: <JSON>\\n\\n。返回 bytes 便于 ASGI 直接发送，减少缓冲。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 async def _chat_stream_generator(request: ChatRequest):
-    """流式生成 SSE 消息。"""
+    """异步生成器：按 Token 流式输出，零阻塞。每块为 data: {\"answer\": \"token内容\"}\\n\\n"""
+    token_count = 0
     try:
+        # 立即发送一个 SSE 注释，让响应头与首包尽快发出，避免客户端长时间等不到首字节
+        yield ": connected\n\n".encode("utf-8")
+        logger.info("[STREAM] 已发送首包 : connected，开始 query_stream")
         async for item in rag_service.query_stream(
             query=request.query,
             tenant_id=request.tenant_id,
@@ -383,14 +387,56 @@ async def _chat_stream_generator(request: ChatRequest):
         ):
             event = item.get("event", "message")
             raw = item.get("data")
-            if isinstance(raw, (dict, list)):
-                data = json.dumps(raw, ensure_ascii=False)
+            if event == "citations":
+                logger.info("[STREAM] yield citations (chunks=%s)", len(raw) if isinstance(raw, list) else 0)
+            elif event == "token":
+                token_count += 1
+                if token_count <= 3 or token_count % 20 == 0:
+                    logger.info("[STREAM] yield token #%s", token_count)
+
+            if event == "citations":
+                citations = raw if isinstance(raw, list) else (raw if raw is not None else [])
+                yield _sse_line({"citations": citations})
+            elif event == "error":
+                msg = raw if isinstance(raw, str) else (str(raw) if raw is not None else "")
+                yield _sse_line({"error": True, "message": msg})
             else:
-                data = json.dumps(raw, ensure_ascii=False) if raw is not None else ""
-            yield _sse_message(event, data)
+                # token / answer / pending / 任意未知 event：只要 data 有内容就作为 answer 吐出，防止因 event 不匹配丢弃
+                if raw is not None:
+                    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                    yield _sse_line({"answer": text})
     except Exception as e:
         logger.exception("流式问答异常: %s", e)
-        yield _sse_message("error", json.dumps({"error": str(e)}, ensure_ascii=False))
+        err_msg = str(e) if e else ""
+        yield _sse_line({"error": True, "message": err_msg})
+
+
+# ---------- 流式调试：用于定位「流式失效」在哪一层 ----------
+async def _debug_stream_generator():
+    """最小流式：不经过 RAG/LLM，每 0.3 秒 yield 一个数字。若前端能逐字显示，说明 API+前端流式正常。"""
+    import asyncio
+    yield ": debug stream\n\n".encode("utf-8")
+    for i in range(1, 11):
+        await asyncio.sleep(0.3)
+        yield _sse_line({"answer": f"{i} "})
+    logger.info("[DEBUG STREAM] 已 yield 10 个 token，流结束")
+
+
+@app.get("/debug/stream")
+async def debug_stream():
+    """
+    调试用：纯流式接口，无 RAG/LLM。用浏览器或 fetch+getReader 请求此接口，
+    若能看到数字 1 2 3 ... 逐个出现，则 API 与前端流式通路正常；否则问题在更上层（如 /chat/stream 的 RAG/LLM 或代理缓冲）。
+    """
+    return StreamingResponse(
+        _debug_stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # 流式问答接口（SSE）
@@ -423,7 +469,8 @@ async def root():
             "health": "/health",
             "ingest": "/ingest",
             "chat": "/chat",
-            "chat_stream": "/chat/stream"
+            "chat_stream": "/chat/stream",
+            "debug_stream": "GET /debug/stream （流式调试，用于定位流式失效）"
         }
     }
 

@@ -232,13 +232,7 @@ class RAGService:
             retrieved_chunks = fused_chunks[:rerank_top_k] if rerank_enabled else fused_chunks[:top_k]
 
             if not retrieved_chunks:
-                async with request_cache_lock:
-                    request_cache[task_id] = {
-                        "status": STATUS_FAILED,
-                        "result": {"success": False, "error": "未找到相关信息"},
-                    }
-                yield {"event": "error", "data": "未找到相关信息"}
-                return
+                retrieved_chunks = []
 
             chunk_ids = [c["id"] for c in retrieved_chunks]
             async with db_manager.get_session() as session:
@@ -312,6 +306,47 @@ class RAGService:
                     or (yaml_config.get("qa_policy", {}).get("cite_required", True) and not extracted_chunk_ids)
                 )
 
+            # 零阻塞：流式结束后在后台写入 DB 与缓存，不阻塞 Token 发送
+            asyncio.create_task(
+                self._save_stream_result(
+                    request_id=request_id,
+                    answer=answer or "",
+                    model_name=model_name,
+                    confidence=confidence,
+                    is_refused=is_refused,
+                    extracted_chunk_ids=extracted_chunk_ids,
+                    chunks_data=chunks_data,
+                    retrieved_chunks=retrieved_chunks,
+                    chunk_ids=chunk_ids,
+                    task_id=task_id,
+                    start_time=start_time,
+                )
+            )
+        except Exception as e:
+            async with request_cache_lock:
+                request_cache[task_id] = {
+                    "status": STATUS_FAILED,
+                    "result": {"success": False, "error": str(e)},
+                }
+            yield {"event": "error", "data": str(e)}
+            raise
+
+    async def _save_stream_result(
+        self,
+        request_id: int,
+        answer: str,
+        model_name: str,
+        confidence: float,
+        is_refused: bool,
+        extracted_chunk_ids: List[int],
+        chunks_data: List[Dict[str, Any]],
+        retrieved_chunks: List[Dict[str, Any]],
+        chunk_ids: List[int],
+        task_id: str,
+        start_time: float,
+    ) -> None:
+        """流式结束后异步写入 DB 与缓存，不阻塞 Token 发送。"""
+        try:
             async with db_manager.get_session() as session:
                 await self.save_citations(
                     session, request_id, extracted_chunk_ids, chunks_data
@@ -357,13 +392,12 @@ class RAGService:
             async with request_cache_lock:
                 request_cache[task_id] = {"status": STATUS_SUCCESS, "result": final_result}
         except Exception as e:
+            logger.exception("流式后保存结果失败: %s", e)
             async with request_cache_lock:
                 request_cache[task_id] = {
                     "status": STATUS_FAILED,
                     "result": {"success": False, "error": str(e)},
                 }
-            yield {"event": "error", "data": str(e)}
-            raise
 
     async def create_qa_request(
         self,

@@ -337,6 +337,7 @@
                         <div class="empty-state-text">开始提问吧，我会基于文档内容为您解答</div>
                     </div>
                     
+                    <!-- 全局唯一原则：每条 AI 回复只占一个气泡；正文在上、引用固定在最下方 -->
                     <div 
                         v-for="(message, index) in messages" 
                         :key="index"
@@ -344,8 +345,6 @@
                     >
                         <div class="message-content">
                             <div class="message-text">{{ message.content }}</div>
-                            
-                            <!-- 引用来源 -->
                             <div v-if="message.citations && message.citations.length > 0" class="citations">
                                 <div class="citations-title">📎 参考来源：</div>
                                 <span 
@@ -360,8 +359,8 @@
                         </div>
                     </div>
                     
-                    <!-- 加载中 -->
-                    <div v-if="loading" class="message assistant">
+                    <!-- 占位符：第一个数据包到达时立即销毁 -->
+                    <div v-if="loading" class="message assistant loading-placeholder">
                         <div class="message-content">
                             <div class="loading">
                                 <el-icon class="is-loading"><Loading /></el-icon>
@@ -475,16 +474,20 @@
                         citations: []
                     });
                     
-                    // 滚动到底部
-                    this.$nextTick(() => {
-                        this.scrollToBottom();
-                    });
+                    this.$nextTick(() => this.scrollToBottom());
                     
-                    // 发送请求
+                    // 全局唯一原则：只添加一个 AI 气泡，整个流式过程只更新该气泡的 content / citations，禁止再 push 新气泡
+                    // 虚拟 DOM：只修改该对象的 content/citations，不替换 messages 数组，避免整表重绘
+                    this.messages.push({
+                        role: 'assistant',
+                        content: '',
+                        citations: []
+                    });
+                    const assistantMessage = this.messages[this.messages.length - 1];
                     this.loading = true;
                     
                     try {
-                        const response = await fetch(`${API_BASE_URL}/chat`, {
+                        const response = await fetch(`${API_BASE_URL}/chat/stream`, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
@@ -501,48 +504,138 @@
                             throw new Error(`HTTP error! status: ${response.status}`);
                         }
                         
-                        const data = await response.json();
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        let chunkCount = 0;
+                        let eventCount = 0;
+                        const DEBUG_STREAM = true;
+                        const THROTTLE_MS = 80;
+
+                        // 节流：累积 token，定时批量写入，避免每个 token 触发一次全量更新
+                        let pendingContent = '';
+                        let flushTimer = null;
+                        const self = this;
+                        function flushContent() {
+                            if (!pendingContent) return;
+                            assistantMessage.content += pendingContent;
+                            pendingContent = '';
+                            self.scrollToBottom();
+                        }
+                        // 当前为纯文本展示，无 marked/markdown-it，无深度 Markdown 重绘
+                        function scheduleFlush() {
+                            if (flushTimer != null) return;
+                            flushTimer = setTimeout(function () {
+                                flushTimer = null;
+                                flushContent();
+                            }, THROTTLE_MS);
+                        }
+
+                        let loadingCleared = false;
+                        function clearLoadingOnce() {
+                            if (!loadingCleared) {
+                                loadingCleared = true;
+                                self.loading = false;
+                            }
+                        }
+                        function processSSEEvent(text) {
+                            const line = text.trim();
+                            if (line.startsWith(':')) return;
+                            if (!line.startsWith('data:')) return;
+                            const payload = line.slice(5).trim();
+                            if (payload === '' || payload === '[DONE]') return payload === '[DONE]';
+                            try {
+                                const data = JSON.parse(payload);
+                                if (data.error === true) {
+                                    if (flushTimer) clearTimeout(flushTimer);
+                                    flushTimer = null;
+                                    pendingContent = '';
+                                    assistantMessage.content = data.message || '请求出错，请稍后重试。';
+                                    ElMessage.error(data.message || '请求出错');
+                                    clearLoadingOnce();
+                                    return 'error';
+                                }
+                                if (Array.isArray(data.citations) && data.citations.length) {
+                                    if (DEBUG_STREAM) console.log('[STREAM] citations received, count=' + data.citations.length);
+                                    assistantMessage.citations = data.citations.map(cit => ({
+                                        chunk_id: cit.chunk_id,
+                                        content: cit.content_preview || cit.content || '',
+                                        document_id: cit.document_id,
+                                        page_start: cit.page_start,
+                                        page_end: cit.page_end,
+                                        section_path: cit.section_path,
+                                        score: cit.score
+                                    }));
+                                    clearLoadingOnce();
+                                    self.scrollToBottom();
+                                }
+                                if (data.answer !== undefined && data.answer !== '') {
+                                    eventCount++;
+                                    if (DEBUG_STREAM && (eventCount <= 3 || eventCount % 20 === 0)) {
+                                        console.log('[STREAM] answer event #' + eventCount + ', +' + (data.answer.length) + ' chars');
+                                    }
+                                    pendingContent += data.answer;
+                                    clearLoadingOnce();
+                                    scheduleFlush();
+                                }
+                            } catch (e) {
+                                if (payload !== '[DONE]') console.warn('SSE parse:', e);
+                            }
+                            return null;
+                        }
                         
-                        // 添加助手回复
-                        const citations = (data.citations || []).map(cit => ({
-                            chunk_id: cit.chunk_id,
-                            content: cit.content_preview || cit.content || '',
-                            document_id: cit.document_id,
-                            page_start: cit.page_start,
-                            page_end: cit.page_end,
-                            section_path: cit.section_path,
-                            score: cit.score
-                        }));
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            chunkCount++;
+                            if (DEBUG_STREAM && chunkCount <= 5) console.log('[STREAM] reader chunk #' + chunkCount + ', size=' + (value ? value.length : 0));
+                            buffer += decoder.decode(value, { stream: true });
+                            const events = buffer.split('\n\n');
+                            buffer = events.pop() || '';
+                            
+                            for (const eventBlock of events) {
+                                const dataLine = eventBlock.split('\n').find(l => l.trimStart().startsWith('data:'));
+                                if (!dataLine) continue;
+                                if (processSSEEvent.call(this, dataLine.trimStart()) === 'error') {
+                                    reader.cancel();
+                                    return;
+                                }
+                            }
+                        }
                         
-                        this.messages.push({
-                            role: 'assistant',
-                            content: data.answer || data.message || '抱歉，我无法回答这个问题。',
-                            citations: citations
-                        });
+                        if (buffer.trim()) {
+                            const dataLine = buffer.split('\n').find(l => l.trimStart().startsWith('data:'));
+                            if (dataLine) processSSEEvent.call(this, dataLine.trimStart());
+                        }
+                        
+                        if (flushTimer) clearTimeout(flushTimer);
+                        flushTimer = null;
+                        flushContent();
+                        if (DEBUG_STREAM) console.log('[STREAM] done. chunks=' + chunkCount + ', answer_events=' + eventCount + ', content_len=' + (assistantMessage.content ? assistantMessage.content.length : 0));
+                        if (!assistantMessage.content) {
+                            assistantMessage.content = '抱歉，我无法回答这个问题。';
+                        }
                         
                     } catch (error) {
                         console.error('发送消息失败:', error);
                         ElMessage.error('发送消息失败，请检查网络连接或服务器状态');
-                        
-                        // 添加错误消息
-                        this.messages.push({
-                            role: 'assistant',
-                            content: '抱歉，发生了错误。请稍后重试。',
-                            citations: []
-                        });
+                        if (typeof assistantMessage !== 'undefined') assistantMessage.content = '抱歉，发生了错误。请稍后重试。';
                     } finally {
                         this.loading = false;
-                        this.$nextTick(() => {
-                            this.scrollToBottom();
-                        });
+                        this.scrollToBottom();
                     }
                 },
                 
                 scrollToBottom() {
-                    const container = this.$refs.messagesContainer;
-                    if (container) {
-                        container.scrollTop = container.scrollHeight;
-                    }
+                    if (this._scrollRafId != null) return;
+                    const self = this;
+                    this._scrollRafId = requestAnimationFrame(function () {
+                        self._scrollRafId = null;
+                        self.$nextTick(() => {
+                            const container = self.$refs.messagesContainer;
+                            if (container) container.scrollTop = container.scrollHeight;
+                        });
+                    });
                 },
                 
                 showCitation(citation) {
