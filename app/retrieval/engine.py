@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.config import yaml_config
 from app.storage.db_manager import db_manager
-from app.storage.models import Chunk, Embedding
+from app.storage.models import Chunk, Document, Embedding
 from app.llm import llm_service
 from app.retrieval.vector_store import VectorStore
 from app.retrieval.bm25_service import BM25Service
@@ -287,26 +287,78 @@ class RetrievalEngine:
         
         logger.info(f"BM25 search returned {len(bm25_results)} results")
         return bm25_results
-    
+
+    async def _filter_by_year(
+        self,
+        chunk_ids: List[int],
+        query_years: List[int],
+        tenant_id: int = 0,
+    ) -> Optional[set]:
+        """
+        按年份过滤 chunk：并集过滤 + 空年份通过 + 内容补偿。
+
+        - 并集：query_years=[2022, 2024] 时保留 metadata.year 为 2022 或 2024 的片段。
+        - 空年份通过：metadata 中无年份的片段一律保留。
+        - 内容补偿：metadata 不匹配时，若片段正文包含目标年份字符串（如 "2022"）则保留。
+
+        Returns:
+            允许的 chunk id 集合（空输入时返回空集合）。
+        """
+        if not chunk_ids or not query_years:
+            return set()
+        years_set = set(query_years)
+        year_strs = [str(y) for y in query_years]
+
+        async with db_manager.get_session() as session:
+            stmt = (
+                select(Chunk.id, Document.year, Chunk.content)
+                .join(Document, Chunk.document_id == Document.id)
+                .where(
+                    Chunk.id.in_(chunk_ids),
+                    Chunk.tenant_id == tenant_id,
+                    Chunk.is_deleted == False,
+                )
+            )
+            result = await session.execute(stmt)
+            rows = result.fetchall()
+
+        allowed = set()
+        for row in rows:
+            cid, doc_year, content = row[0], row[1], (row[2] or "")
+            # 并集：metadata 年份在 query_years 中则保留
+            if doc_year is not None and doc_year in years_set:
+                allowed.add(cid)
+                continue
+            # 空年份通过：缺失年份信息则保留
+            if doc_year is None:
+                allowed.add(cid)
+                continue
+            # 内容补偿：正文包含目标年份字符串则保留
+            if any(ys in content for ys in year_strs):
+                allowed.add(cid)
+        return allowed
+
     async def retrieve(
         self,
         query: str,
         top_k: int = 5,
-        tenant_id: int = 0
+        tenant_id: int = 0,
+        years: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """
-        混合检索接口（向量搜索 + BM25 + RRF融合）
-        
+        混合检索接口（向量搜索 + BM25 + 加权RRF融合），支持按年份过滤。
+
         Args:
             query: 查询文本
             top_k: 返回的 Top-K 数量
             tenant_id: 租户ID
-        
+            years: 可选，仅保留文档年份在此列表中的 chunk（如 [2023, 2024]）
+
         Returns:
             检索结果字典，包含 chunks 列表
         """
         try:
-            # 1. 向量搜索（如果失败会自动降级到BM25）
+            # 1. 向量搜索
             vector_results = []
             try:
                 vector_results = await self.vector_search(
@@ -317,9 +369,8 @@ class RetrievalEngine:
             except Exception as e:
                 logger.warning(f"Vector search failed, will use BM25 only: {e}")
                 vector_results = []
-            
-            # 2. BM25关键词搜索（作为降级方案，即使向量搜索失败也会执行）
-            # 确保至少有一种搜索方式能返回结果
+
+            # 2. BM25 关键词搜索
             bm25_results = []
             try:
                 bm25_results = await self.keyword_search(
@@ -330,34 +381,57 @@ class RetrievalEngine:
             except Exception as e:
                 logger.error(f"BM25 search also failed: {e}")
                 bm25_results = []
-            
-            # 如果两种搜索都失败，记录警告但继续处理
+
             if not vector_results and not bm25_results:
                 logger.warning(f"Both vector and BM25 search failed for query: {query[:50]}...")
-            
-            # 3. RRF融合
+
+            # 2.5 年份过滤（并集 + 空年份通过 + 内容补偿 + 过少时降级）
+            if years:
+                all_ids = list(dict.fromkeys(
+                    [r["id"] for r in vector_results] + [r["id"] for r in bm25_results]
+                ))
+                if all_ids:
+                    allowed_ids = await self._filter_by_year(
+                        chunk_ids=all_ids,
+                        query_years=years,
+                        tenant_id=tenant_id,
+                    )
+                    if len(allowed_ids) < 3:
+                        logger.warning(
+                            "[Year Filter] 过滤后片段过少(%d)，降级保留原始检索 Top %d",
+                            len(allowed_ids), min(5, len(all_ids)),
+                        )
+                        allowed_ids = set(all_ids)
+                    vector_results = [r for r in vector_results if r["id"] in allowed_ids]
+                    bm25_results = [r for r in bm25_results if r["id"] in allowed_ids]
+                    logger.info(
+                        "[Year Filter] query_years=%s(并集), allowed chunks: %d",
+                        years, len(allowed_ids),
+                    )
+
+            # 3. 加权 RRF 融合（向量 0.6，BM25 0.4，保证财务数据精确度）
+            rrf_k = self.retrieval_config.get("rrf_k", 60)
+            vector_weight = self.retrieval_config.get("rrf_vector_weight", 0.6)
+            bm25_weight = self.retrieval_config.get("rrf_bm25_weight", 0.4)
+
             if vector_results and bm25_results:
-                # 使用RRF融合两个结果列表
-                rrf_k = self.retrieval_config.get("rrf_k", 60)
                 fused_results = rrf_fusion(
                     result_lists=[vector_results, bm25_results],
                     k=rrf_k,
-                    top_k=top_k
+                    top_k=top_k,
+                    weights=[vector_weight, bm25_weight],
                 )
-                
                 logger.info(
-                    f"[Hybrid Search] Vector: {len(vector_results)}, "
-                    f"BM25: {len(bm25_results)}, "
-                    f"Fused: {len(fused_results)}"
+                    "[Hybrid Search] Vector: %d, BM25: %d, Fused: %d (weights %.1f:%.1f)",
+                    len(vector_results), len(bm25_results), len(fused_results),
+                    vector_weight, bm25_weight,
                 )
             elif vector_results:
-                # 只有向量搜索结果
                 fused_results = vector_results[:top_k]
-                logger.info(f"[Hybrid Search] Vector only: {len(fused_results)} results")
+                logger.info("[Hybrid Search] Vector only: %d results", len(fused_results))
             elif bm25_results:
-                # 只有BM25搜索结果
                 fused_results = bm25_results[:top_k]
-                logger.info(f"[Hybrid Search] BM25 only: {len(fused_results)} results")
+                logger.info("[Hybrid Search] BM25 only: %d results", len(fused_results))
             else:
                 # 没有搜索结果
                 fused_results = []

@@ -3,7 +3,7 @@ RRF (Reciprocal Rank Fusion) 算法实现
 用于融合多个检索结果列表
 """
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -12,77 +12,68 @@ logger = logging.getLogger(__name__)
 def rrf_fusion(
     result_lists: List[List[Dict[str, Any]]],
     k: int = 60,
-    top_k: int = 10
+    top_k: int = 10,
+    weights: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    RRF (Reciprocal Rank Fusion) 融合算法
-    
-    公式: score(d) = Σ(1 / (k + rank(q, d)))
-    其中:
-    - d: 文档/chunk
-    - q: 查询
-    - rank(q, d): 文档在查询q的结果中的排名（从1开始）
-    - k: 常数，通常取60
-    
+    RRF (Reciprocal Rank Fusion) 融合算法，支持各列表权重
+
+    公式: score(d) = Σ weight_i * (1 / (k + rank(q_i, d)))
+    其中 weight_i 默认为 1.0；用于区分全文检索(关键词)与向量检索(语义)等。
+
     Args:
-        result_lists: 多个检索结果列表，每个列表包含 {'id': int, 'score': float, ...} 格式的字典
+        result_lists: 多个检索结果列表，每个列表包含 {'id': int, 'score': float, ...}
         k: RRF 常数，默认60
         top_k: 返回前K个结果
-    
+        weights: 各列表权重，与 result_lists 一一对应；如 [0.6, 0.4] 表示第一路 0.6、第二路 0.4
+
     Returns:
         融合后的结果列表，按RRF分数降序排列
     """
     if not result_lists:
         return []
-    
-    # 统计每个文档在所有查询结果中的排名和分数
-    doc_scores = defaultdict(float)  # {doc_id: rrf_score}
-    doc_data = {}  # {doc_id: doc_data} 保存第一个出现的完整文档数据
-    
-    # 遍历每个查询的结果列表
+
+    # 统计每个文档在所有查询结果中的加权分数
+    doc_scores = defaultdict(float)
+    doc_data = {}
+
     for query_idx, result_list in enumerate(result_lists):
         if not result_list:
             continue
-        
-        # 遍历该查询结果中的每个文档
+        weight = 1.0
+        if weights is not None and query_idx < len(weights):
+            weight = weights[query_idx]
+
         for rank, doc in enumerate(result_list, start=1):
             doc_id = doc.get('id')
             if not doc_id:
-                # 如果没有id，尝试使用其他唯一标识
-                doc_id = id(doc)  # 使用对象id作为fallback
+                doc_id = id(doc)
                 doc['id'] = doc_id
-            
-            # 计算RRF分数贡献
-            rrf_contribution = 1.0 / (k + rank)
+
+            rrf_contribution = weight * (1.0 / (k + rank))
             doc_scores[doc_id] += rrf_contribution
-            
-            # 保存文档数据（如果第一次出现）
+
             if doc_id not in doc_data:
                 doc_data[doc_id] = doc.copy()
-                doc_data[doc_id]['rrf_score'] = 0.0  # 初始化
-                doc_data[doc_id]['ranks'] = []  # 记录在各个查询中的排名
-                doc_data[doc_id]['scores'] = []  # 记录原始分数
-    
-    # 更新每个文档的RRF分数和元数据
+                doc_data[doc_id]['rrf_score'] = 0.0
+                doc_data[doc_id]['ranks'] = []
+                doc_data[doc_id]['scores'] = []
+
     for doc_id, rrf_score in doc_scores.items():
         if doc_id in doc_data:
             doc_data[doc_id]['rrf_score'] = rrf_score
-    
-    # 按RRF分数降序排序
+
     sorted_docs = sorted(
         doc_data.values(),
         key=lambda x: x.get('rrf_score', 0.0),
         reverse=True
     )
-    
-    # 返回前top_k个结果
     result = sorted_docs[:top_k]
-    
+
     logger.info(
-        f"[RRF Fusion] 融合 {len(result_lists)} 个查询结果，"
-        f"共 {len(doc_scores)} 个唯一文档，返回 Top {len(result)} 个"
+        "[RRF Fusion] 融合 %d 个查询结果，共 %d 个唯一文档，返回 Top %d 个",
+        len(result_lists), len(doc_scores), len(result)
     )
-    
     return result
 
 

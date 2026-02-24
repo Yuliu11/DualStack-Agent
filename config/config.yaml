@@ -53,6 +53,8 @@ retrieval:
   query_rewrite_enabled: true  # 是否启用查询扩写功能
   multi_route_top_k: 10  # 多路检索中每个查询取Top K个结果
   rrf_k: 60  # RRF融合算法中的常数k
+  rrf_vector_weight: 0.6  # 向量检索(语义)权重
+  rrf_bm25_weight: 0.4    # 全文检索(关键词)权重，保证财务数据精确度
   rerank_enabled: false  # 是否启用重排序（需要配置reranker服务）
   rerank_top_k: 5  # 重排序后返回Top K个结果
 

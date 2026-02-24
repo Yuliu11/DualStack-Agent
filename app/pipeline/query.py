@@ -51,7 +51,8 @@ class QueryRewriter:
                 'rewritten_queries': [query],
                 'primary_query': query,
                 'rewrite_type': 'disabled',
-                'rewrite_details': {}
+                'rewrite_details': {},
+                'extracted_years': [],
             }
         
         try:
@@ -136,12 +137,15 @@ class QueryRewriter:
                 f"(生成 {len(rewritten_queries)} 个查询)"
             )
             
+            details = rewrite_result.get('details', {})
+            details['extracted_years'] = rewrite_result.get('extracted_years', [])
             return {
                 'original_query': query,
                 'rewritten_queries': rewritten_queries,
                 'primary_query': primary_query,
                 'rewrite_type': 'full',
-                'rewrite_details': rewrite_result.get('details', {})
+                'rewrite_details': details,
+                'extracted_years': rewrite_result.get('extracted_years', []),
             }
             
         except Exception as e:
@@ -156,7 +160,8 @@ class QueryRewriter:
                 'rewritten_queries': [query],
                 'primary_query': query,
                 'rewrite_type': 'degraded',
-                'rewrite_details': {'error': str(e)}
+                'rewrite_details': {'error': str(e)},
+                'extracted_years': [],
             }
     
     def _build_rewrite_prompt(
@@ -207,22 +212,28 @@ class QueryRewriter:
 - 改写2："大树科技的经营范围和核心产品有哪些？"
 - 改写3："大树科技的业务模式和收入来源是什么？"
 
+**任务D：时间维度提取**
+从用户问题中提取时间/年份（如 2023、2024、去年、今年等），用于检索时过滤文档。在输出的 JSON 中增加 "extracted_years" 数组，如 [2023, 2024]；若无法识别或问题与年份无关则返回空数组 []。
+
 **输出格式（必须是有效的JSON）：**
 {{
     "primary_query": "改写后的主要查询（用于显示）",
     "rewritten_queries": ["查询1", "查询2", "查询3"],
+    "extracted_years": [2023, 2024],
     "details": {{
         "context_completion": "上下文补全说明",
         "keyword_expansion": "关键词扩展说明",
-        "multi_dimension": "多维度重写说明"
+        "multi_dimension": "多维度重写说明",
+        "time_dimension": "时间维度提取说明"
     }}
 }}
 
 **要求：**
 1. 必须返回有效的JSON格式
 2. rewritten_queries 数组应包含2-3个不同角度的查询
-3. 如果无法改写，至少返回原始查询
-4. 保持查询的语义完整性{history_context}"""
+3. extracted_years 为数字数组，仅包含从问题中识别出的年份
+4. 如果无法改写，至少返回原始查询
+5. 保持查询的语义完整性{history_context}"""
     
     def _parse_rewrite_result(self, llm_output: str, original_query: str) -> Dict[str, Any]:
         """解析 LLM 返回的改写结果"""
@@ -250,7 +261,13 @@ class QueryRewriter:
             
             if 'rewritten_queries' not in result or not result['rewritten_queries']:
                 result['rewritten_queries'] = [result.get('primary_query', original_query)]
-            
+            if 'extracted_years' not in result or not isinstance(result.get('extracted_years'), list):
+                result['extracted_years'] = []
+            else:
+                result['extracted_years'] = [int(y) for y in result['extracted_years'] if isinstance(y, (int, float)) or (isinstance(y, str) and y.isdigit())]
+            if 'details' not in result:
+                result['details'] = {}
+            result['details']['extracted_years'] = result.get('extracted_years', [])
             return result
             
         except json.JSONDecodeError as e:

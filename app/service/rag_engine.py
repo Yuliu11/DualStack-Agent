@@ -2,6 +2,7 @@
 RAG 核心服务
 协调检索引擎和 LLM 服务，实现完整的 RAG 流程
 """
+import asyncio
 import hashlib
 import json
 import re
@@ -127,13 +128,73 @@ class RAGService:
                 'page_end': chunk.page_end,
                 'section_path': chunk.section_path,
                 'is_table': chunk.is_table,
-                'table_id': chunk.table_id
+                'table_id': chunk.table_id,
+                'document_id': chunk.document_id,
             }
             for chunk in chunks
         ]
 
+    @staticmethod
+    def _merge_adjacent_chunks_by_document(
+        chunks_data: List[Dict[str, Any]],
+        page_window: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        将同一 document_id 且位置临近的 chunk 合并为一段上下文，保证连贯性。
+        返回列表项为 {"chunk_ids": [id1, id2, ...], "content": "合并后的文本", "document_id": int}。
+        """
+        if not chunks_data:
+            return []
+        # 按 document_id、page_start 排序
+        key = lambda c: (c.get("document_id") or 0, c.get("page_start") or 0)
+        sorted_chunks = sorted(chunks_data, key=key)
+        merged = []
+        current_doc = None
+        current_page_end = -1
+        current_ids = []
+        current_parts = []
+
+        def flush():
+            if current_ids and current_parts:
+                merged.append({
+                    "chunk_ids": current_ids[:],
+                    "content": "\n\n".join(current_parts),
+                    "document_id": current_doc,
+                })
+
+        for c in sorted_chunks:
+            doc_id = c.get("document_id")
+            page_start = c.get("page_start") or 0
+            page_end = c.get("page_end") or page_start
+            if doc_id != current_doc:
+                flush()
+                current_doc = doc_id
+                current_page_end = page_end
+                current_ids = [c["id"]]
+                current_parts = [c.get("content", "")]
+                continue
+            if page_start <= current_page_end + page_window:
+                current_ids.append(c["id"])
+                current_parts.append(c.get("content", ""))
+                current_page_end = max(current_page_end, page_end)
+            else:
+                flush()
+                current_page_end = page_end
+                current_ids = [c["id"]]
+                current_parts = [c.get("content", "")]
+        flush()
+        return merged
+
     def _build_context_from_chunks(self, chunks_data: List[Dict[str, Any]]) -> str:
-        """将 chunk 列表格式化为带 [Chunk ID] 的上下文字符串"""
+        """将 chunk 列表格式化为带 [Chunk ID] 的上下文字符串。若含 document_id 则先按同文档邻近合并再输出。"""
+        if not chunks_data:
+            return ""
+        if any(c.get("document_id") is not None for c in chunks_data):
+            merged = self._merge_adjacent_chunks_by_document(chunks_data)
+            return "\n\n".join(
+                " ".join(f"[Chunk {cid}]" for cid in group["chunk_ids"]) + "\n" + group["content"]
+                for group in merged
+            )
         return "\n\n".join(
             f"[Chunk {chunk['id']}]\n{chunk.get('content', '')}"
             for chunk in chunks_data
@@ -372,33 +433,47 @@ class RAGService:
                 }
                 await session.commit()
             
-            # 3. 多路召回：使用改写后的查询进行检索
-            # 对每个改写后的查询进行检索，各取Top 10个结果
+            # 3. 多路召回：使用改写后的查询并发检索（每路携带时间约束）
             retrieval_config = yaml_config.get("retrieval", {})
             multi_route_top_k = retrieval_config.get("multi_route_top_k", 10)  # 每个查询取Top 10
             rrf_k = retrieval_config.get("rrf_k", 60)  # RRF常数k
-            
-            retrieval_results = []
-            
-            for rewritten_query in rewritten_queries:
-                logger.info(f"[Multi-Route Retrieval] 查询: {rewritten_query[:50]}...")
-                
-                retrieval_result = await self.retrieval_engine.retrieve(
+            extracted_years = rewrite_result.get("extracted_years") or rewrite_result.get("rewrite_details", {}).get("extracted_years")
+            if extracted_years:
+                logger.info("[Year Filter] 多路检索携带时间约束: years=%s", extracted_years)
+
+            retrieval_start = time.time()
+            tasks = [
+                self.retrieval_engine.retrieve(
                     query=rewritten_query,
-                    top_k=multi_route_top_k,  # 每个查询取Top 10
-                    tenant_id=tenant_id
+                    top_k=multi_route_top_k,
+                    tenant_id=tenant_id,
+                    years=extracted_years,
                 )
-                
-                retrieval_results.append({
-                    'query': rewritten_query,
-                    'chunks': retrieval_result.get('chunks', [])
-                })
-                
-                logger.info(
-                    f"[Multi-Route Retrieval] 查询 '{rewritten_query[:30]}...' "
-                    f"检索到 {len(retrieval_result.get('chunks', []))} 个结果"
-                )
-            
+                for rewritten_query in rewritten_queries
+            ]
+            gather_results = await asyncio.gather(*tasks, return_exceptions=True)
+            retrieval_elapsed = time.time() - retrieval_start
+            logger.info("并发检索耗时: %.2fs", retrieval_elapsed)
+
+            retrieval_results = []
+            for i, rewritten_query in enumerate(rewritten_queries):
+                if isinstance(gather_results[i], Exception):
+                    logger.warning(
+                        "[Multi-Route Retrieval] 查询 '%s...' 检索异常: %s",
+                        rewritten_query[:30],
+                        gather_results[i],
+                    )
+                    retrieval_results.append({"query": rewritten_query, "chunks": []})
+                else:
+                    retrieval_result = gather_results[i]
+                    chunks = retrieval_result.get("chunks", [])
+                    retrieval_results.append({"query": rewritten_query, "chunks": chunks})
+                    logger.info(
+                        "[Multi-Route Retrieval] 查询 '%s...' 检索到 %d 个结果",
+                        rewritten_query[:30],
+                        len(chunks),
+                    )
+
             # 4. RRF融合：将多个查询结果进行RRF融合
             logger.info(
                 f"[RRF Fusion] 开始融合 {len(retrieval_results)} 个查询结果，"
@@ -410,11 +485,26 @@ class RAGService:
                 k=rrf_k,
                 top_k=top_k * 2  # 融合后取更多候选，供重排序使用
             )
-            
+
+            # 4.5 按 chunk_id 严格去重，保留得分最高的一条
+            seen_ids = set()
+            deduped_chunks = []
+            for c in fused_chunks:
+                cid = c.get("id")
+                if cid is not None and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    deduped_chunks.append(c)
+            if len(deduped_chunks) < len(fused_chunks):
+                logger.info(
+                    "[Dedup] 按 chunk_id 去重: %d -> %d",
+                    len(fused_chunks), len(deduped_chunks),
+                )
+            fused_chunks = deduped_chunks
+
             logger.info(
-                f"[RRF Fusion] 融合完成，得到 {len(fused_chunks)} 个候选chunks"
+                "[RRF Fusion] 融合完成，得到 %d 个候选chunks", len(fused_chunks)
             )
-            
+
             # 5. 重排序（可选）：如果配置了reranker，进行精排
             rerank_enabled = retrieval_config.get("rerank_enabled", False)
             rerank_top_k = retrieval_config.get("rerank_top_k", 5)
