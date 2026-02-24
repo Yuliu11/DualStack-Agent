@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
 
 from sqlalchemy import select, and_
@@ -25,6 +25,14 @@ from app.tools.calculator import CalculatorTool
 # 配置日志
 import logging
 logger = logging.getLogger(__name__)
+
+# 幂等缓存（进程内）：{task_id: {"status": str, "result": dict}}
+request_cache: Dict[str, Dict[str, Any]] = {}
+request_cache_lock = asyncio.Lock()
+
+STATUS_PENDING = "PENDING"
+STATUS_SUCCESS = "SUCCESS"
+STATUS_FAILED = "FAILED"
 
 # CALC 意图：从参考资料中抽取数字并判断运算类型的系统提示
 CALC_EXTRACT_SYSTEM_PROMPT = """你是一个数据分析助手。请阅读提供的【参考资料】，提取回答【用户问题】所需的数字，并判断运算类型。
@@ -77,7 +85,286 @@ class RAGService:
     def calculate_query_hash(self, query: str) -> str:
         """计算查询的 SHA256 哈希值"""
         return hashlib.sha256(query.encode('utf-8')).hexdigest()
-    
+
+    def _make_task_id(self, user_id: Optional[int], query: str) -> str:
+        """基于 user_id + query 生成幂等 task_id（SHA256）"""
+        uid = 0 if user_id is None else int(user_id)
+        q = (query or "").strip()
+        raw = f"{uid}|{q}".encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    async def query_idempotent(
+        self,
+        query: str,
+        tenant_id: int = 0,
+        user_id: Optional[int] = None,
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        带幂等性的 query：同一 user_id + query 在同一进程内保证去重执行。
+
+        Returns:
+            {
+              "task_id": str,
+              "status": "SUCCESS" | "PENDING" | "FAILED",
+              "result": Optional[dict]
+            }
+        """
+        task_id = self._make_task_id(user_id, query)
+
+        async with request_cache_lock:
+            entry = request_cache.get(task_id)
+            if entry and entry.get("status") == STATUS_SUCCESS:
+                logger.info(
+                    "[Idempotency] Hit cache for task_id: %s, skipping execution.",
+                    task_id,
+                )
+                return {"task_id": task_id, "status": STATUS_SUCCESS, "result": entry.get("result")}
+            if entry and entry.get("status") == STATUS_PENDING:
+                return {"task_id": task_id, "status": STATUS_PENDING, "result": None}
+
+            # 任务锁定：先标记为 PENDING
+            request_cache[task_id] = {"status": STATUS_PENDING, "result": None}
+
+        try:
+            result = await self.query(
+                query=query,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                top_k=top_k,
+            )
+        except Exception as e:
+            async with request_cache_lock:
+                request_cache[task_id] = {
+                    "status": STATUS_FAILED,
+                    "result": {"success": False, "error": str(e)},
+                }
+            raise
+
+        async with request_cache_lock:
+            request_cache[task_id] = {"status": STATUS_SUCCESS, "result": result}
+
+        return {"task_id": task_id, "status": STATUS_SUCCESS, "result": result}
+
+    async def query_stream(
+        self,
+        query: str,
+        tenant_id: int = 0,
+        user_id: Optional[int] = None,
+        top_k: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        流式问答：先 yield 引用来源（citations），再逐块 yield 答案内容。
+        若幂等缓存中已有 SUCCESS 结果，则直接 yield 该结果（先 citations 再 answer）；新请求走正常流式生成。
+        """
+        task_id = self._make_task_id(user_id, query)
+        async with request_cache_lock:
+            entry = request_cache.get(task_id)
+            if entry and entry.get("status") == STATUS_SUCCESS:
+                logger.info(
+                    "[Idempotency] Hit cache for task_id: %s, skipping execution.",
+                    task_id,
+                )
+                result = entry.get("result") or {}
+                yield {"event": "citations", "data": result.get("citations", [])}
+                yield {"event": "answer", "data": result.get("answer", "")}
+                return
+            if entry and entry.get("status") == STATUS_PENDING:
+                yield {"event": "pending", "data": "请求正在处理中，请稍候"}
+                return
+            request_cache[task_id] = {"status": STATUS_PENDING, "result": None}
+
+        start_time = time.time()
+        request_id = None
+        try:
+            async with db_manager.get_session() as session:
+                qa_request = await self.create_qa_request(
+                    session, query, tenant_id, user_id
+                )
+                request_id = qa_request.id
+                await session.commit()
+
+            rewrite_result = await query_rewriter.rewrite_query(
+                query=query, conversation_history=None, tenant_id=tenant_id
+            )
+            rewritten_queries = rewrite_result.get("rewritten_queries", [query])
+            extracted_years = rewrite_result.get("extracted_years") or rewrite_result.get("rewrite_details", {}).get("extracted_years")
+
+            retrieval_config = yaml_config.get("retrieval", {})
+            multi_route_top_k = retrieval_config.get("multi_route_top_k", 10)
+            rrf_k = retrieval_config.get("rrf_k", 60)
+            top_k = top_k or self.default_top_k
+
+            tasks = [
+                self.retrieval_engine.retrieve(
+                    query=q,
+                    top_k=multi_route_top_k,
+                    tenant_id=tenant_id,
+                    years=extracted_years,
+                )
+                for q in rewritten_queries
+            ]
+            gather_results = await asyncio.gather(*tasks, return_exceptions=True)
+            retrieval_results = []
+            for i, q in enumerate(rewritten_queries):
+                if isinstance(gather_results[i], Exception):
+                    retrieval_results.append({"query": q, "chunks": []})
+                else:
+                    r = gather_results[i]
+                    retrieval_results.append({"query": q, "chunks": r.get("chunks", [])})
+
+            fused_chunks = merge_with_rrf(
+                retrieval_results=retrieval_results,
+                k=rrf_k,
+                top_k=top_k * 2,
+            )
+            seen_ids = set()
+            deduped = []
+            for c in fused_chunks:
+                cid = c.get("id")
+                if cid is not None and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    deduped.append(c)
+            fused_chunks = deduped
+
+            rerank_enabled = retrieval_config.get("rerank_enabled", False)
+            rerank_top_k = retrieval_config.get("rerank_top_k", 5)
+            retrieved_chunks = fused_chunks[:rerank_top_k] if rerank_enabled else fused_chunks[:top_k]
+
+            if not retrieved_chunks:
+                async with request_cache_lock:
+                    request_cache[task_id] = {
+                        "status": STATUS_FAILED,
+                        "result": {"success": False, "error": "未找到相关信息"},
+                    }
+                yield {"event": "error", "data": "未找到相关信息"}
+                return
+
+            chunk_ids = [c["id"] for c in retrieved_chunks]
+            async with db_manager.get_session() as session:
+                chunks_data = await self.get_chunks_by_ids(
+                    session, chunk_ids, tenant_id
+                )
+            context_text = self._build_context_from_chunks(chunks_data)
+            intent = await intent_router.get_intent(query)
+
+            citations = [
+                {
+                    "chunk_id": c["id"],
+                    "content_preview": (c.get("content") or "")[:200],
+                    "page_start": c.get("page_start"),
+                    "page_end": c.get("page_end"),
+                    "section_path": c.get("section_path"),
+                }
+                for c in chunks_data
+            ]
+            yield {"event": "citations", "data": citations}
+
+            answer = None
+            model_name = "unknown"
+            confidence = 0.0
+            is_refused = False
+            extracted_chunk_ids = list(chunk_ids)
+
+            if intent == "CALC":
+                calc_out = await self._handle_calc_logic(
+                    query=query, context=context_text, request_id=request_id
+                )
+                if not calc_out.get("fallback"):
+                    answer, model_name = await self._synthesize_calc_answer(
+                        query=query,
+                        context=context_text,
+                        result=calc_out.get("result"),
+                        formula=calc_out.get("formula", ""),
+                        request_id=request_id,
+                    )
+                    confidence = 0.85
+                    is_refused = False
+            elif intent == "SUMMARY":
+                answer, model_name = await self._handle_summary_logic(
+                    query=query,
+                    context=context_text,
+                    request_id=request_id,
+                )
+                confidence = 0.9
+                is_refused = False
+
+            if answer is not None:
+                for ch in answer:
+                    yield {"event": "token", "data": ch}
+                extracted_chunk_ids = chunk_ids
+            else:
+                full_answer = []
+                async for token in llm_service.generate_answer_stream(
+                    query=query,
+                    context_chunks=chunks_data,
+                    request_id=request_id,
+                ):
+                    full_answer.append(token)
+                    yield {"event": "token", "data": token}
+                answer = "".join(full_answer)
+                extracted_chunk_ids = llm_service._extract_chunk_ids(answer)
+                confidence = llm_service._calculate_confidence(answer, chunks_data)
+                min_conf = yaml_config.get("qa_policy", {}).get("min_confidence", 0.6)
+                is_refused = (
+                    not answer
+                    or (yaml_config.get("qa_policy", {}).get("refuse_if_low_conf", True) and confidence < min_conf)
+                    or (yaml_config.get("qa_policy", {}).get("cite_required", True) and not extracted_chunk_ids)
+                )
+
+            async with db_manager.get_session() as session:
+                await self.save_citations(
+                    session, request_id, extracted_chunk_ids, chunks_data
+                )
+                stmt = select(QARequest).where(QARequest.id == request_id)
+                res = await session.execute(stmt)
+                qa_request = res.scalar_one()
+                qa_request.answer_text = answer or ""
+                qa_request.answer_model = model_name
+                qa_request.confidence = confidence
+                qa_request.is_refused = is_refused
+                qa_request.latency_ms = int((time.time() - start_time) * 1000)
+                qa_request.retrieval_json = {
+                    "chunks_count": len(retrieved_chunks),
+                    "chunk_ids": chunk_ids,
+                    "extracted_chunk_ids": extracted_chunk_ids,
+                }
+                await session.commit()
+
+            final_citations = [
+                {
+                    "chunk_id": c["id"],
+                    "content_preview": (c.get("content") or "")[:200],
+                    "page_start": c.get("page_start"),
+                    "page_end": c.get("page_end"),
+                    "section_path": c.get("section_path"),
+                }
+                for c in chunks_data
+                if c["id"] in extracted_chunk_ids
+            ]
+            final_result = {
+                "success": True,
+                "request_id": request_id,
+                "answer": answer or "",
+                "confidence": confidence,
+                "is_refused": is_refused,
+                "model_name": model_name,
+                "citations": final_citations,
+                "retrieved_chunks_count": len(retrieved_chunks),
+                "cited_chunks_count": len(extracted_chunk_ids),
+                "latency_ms": int((time.time() - start_time) * 1000),
+            }
+            async with request_cache_lock:
+                request_cache[task_id] = {"status": STATUS_SUCCESS, "result": final_result}
+        except Exception as e:
+            async with request_cache_lock:
+                request_cache[task_id] = {
+                    "status": STATUS_FAILED,
+                    "result": {"success": False, "error": str(e)},
+                }
+            yield {"event": "error", "data": str(e)}
+            raise
+
     async def create_qa_request(
         self,
         session: AsyncSession,

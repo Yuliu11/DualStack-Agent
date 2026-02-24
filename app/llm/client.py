@@ -6,7 +6,7 @@ import asyncio
 import time
 import random
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncIterator, Union
 from enum import Enum
 from datetime import datetime
 from dataclasses import dataclass
@@ -217,7 +217,7 @@ class LLMService:
         *args,
         **kwargs
     ):
-        """带重试的调用"""
+        """带重试的调用。当 func 返回 AsyncIterator（stream=True）时，直接返回该迭代器，不当作 ChatCompletion 处理。"""
         max_attempts = self.retry_config.get("max_attempts", 3)
         wait_multiplier = self.retry_config.get("wait_exponential_multiplier", 1)
         wait_max = self.retry_config.get("wait_exponential_max", 10)
@@ -232,7 +232,9 @@ class LLMService:
             try:
                 # 彻底删除 request_id，确保不会传递给 SDK
                 kwargs.pop('request_id', None)
-                return await func(*args, **kwargs)
+                result = await func(*args, **kwargs)
+                # 流式时 result 为 AsyncIterator，直接返回，避免被当作 ChatCompletion 做任何访问
+                return result
             except Exception as e:
                 last_exc = e
                 
@@ -287,8 +289,8 @@ class LLMService:
         stream: bool = False,
         request_id: Optional[int] = None,
         **kwargs
-    ) -> ChatCompletion:
-        """调用 DeepSeek API"""
+    ) -> Union[ChatCompletion, AsyncIterator]:
+        """调用 DeepSeek API。stream=True 时返回 AsyncIterator，否则返回 ChatCompletion。"""
         async def _call():
             response = await self.deepseek_client.chat.completions.create(
                 model=self.deepseek_model,
@@ -310,8 +312,8 @@ class LLMService:
         stream: bool = False,
         request_id: Optional[int] = None,
         **kwargs
-    ) -> ChatCompletion:
-        """调用阿里云百炼 API"""
+    ) -> Union[ChatCompletion, AsyncIterator]:
+        """调用阿里云百炼 API。stream=True 时返回 AsyncIterator，否则返回 ChatCompletion。"""
         async def _call():
             # DashScope SDK 只支持标准 OpenAI 兼容参数
             # 彻底删除所有非标准参数，确保不会传递给 SDK
@@ -349,18 +351,18 @@ class LLMService:
         stream: bool = False,
         request_id: Optional[int] = None,
         **kwargs
-    ) -> ChatCompletion:
+    ) -> Union[ChatCompletion, AsyncIterator]:
         """
-        聊天补全方法，支持主备模型切换
-        
+        聊天补全方法，支持主备模型切换。
+
         Args:
             messages: 消息列表
             stream: 是否流式返回
             request_id: 请求ID（用于关联 model_events）
             **kwargs: 其他 OpenAI API 参数
-        
+
         Returns:
-            ChatCompletion 对象
+            stream=False 时返回 ChatCompletion；stream=True 时返回 AsyncIterator（可直接 async for 迭代）。
         """
         # 优先尝试主模型（DeepSeek）
         if self.deepseek_circuit.should_attempt():
@@ -371,7 +373,7 @@ class LLMService:
                     request_id=request_id,
                     **kwargs
                 )
-                # 成功则重置熔断器
+                # 获取到响应（非流时为 ChatCompletion，流时为 AsyncIterator）即视为成功，重置熔断器
                 self.deepseek_circuit.record_success()
                 return response
             except Exception as e:
@@ -423,6 +425,7 @@ class LLMService:
                 request_id=request_id,  # 仅用于日志记录，不会传递给 SDK
                 **kwargs
             )
+            # 流式时 response 为 AsyncIterator，原样返回供上层 async for 消费
             return response
         except Exception as e:
             # 备用模型也失败
@@ -439,6 +442,58 @@ class LLMService:
                 request_id=request_id
             )
             raise
+
+    async def generate_answer_stream(
+        self,
+        query: str,
+        context_chunks: List[Dict[str, Any]],
+        request_id: Optional[int] = None,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        流式生成答案：与 generate_answer 使用相同上下文与提示，但 stream=True，
+        正确消费 AsyncOpenAI 返回的 stream 对象并逐块 yield 内容。
+        """
+        context_text = "\n\n".join([
+            f"[Chunk {chunk['id']}]\n{chunk['content']}"
+            for chunk in context_chunks
+        ])
+        system_prompt = self.load_prompt(
+            "rag_answer.system_template",
+            context=context_text
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query}
+        ]
+        raw = await self.chat_completion(
+            messages=messages,
+            stream=True,
+            request_id=request_id,
+            **kwargs
+        )
+        if raw is None:
+            return
+        # 确保得到的是可异步迭代的对象（AsyncOpenAI stream 对象）
+        stream = raw
+        if not hasattr(stream, "__aiter__"):
+            return
+        async for chunk in stream:
+            if chunk is None:
+                continue
+            choices = getattr(chunk, "choices", None)
+            if not choices or len(choices) == 0:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            content = getattr(delta, "content", None)
+            if content is None and isinstance(delta, dict):
+                content = delta.get("content")
+            if not content:
+                continue
+            await asyncio.sleep(0)
+            yield content
     
     def _extract_chunk_ids(self, text: str) -> List[int]:
         """从文本中提取 Chunk ID（格式：[Chunk ID] 或 [Chunk 123]）"""
