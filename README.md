@@ -480,7 +480,7 @@ score = Σ(1 / (k + rank(q, d)))
 
 ---
 
-## 📝 使用示例
+## 使用示例
 
 ### 批量摄取文档
 
@@ -516,7 +516,7 @@ print(f"引用: {result['citations']}")
 
 ---
 
-## 🐛 故障排查
+## 故障排查
 
 ### 常见问题
 
@@ -542,7 +542,7 @@ print(f"引用: {result['citations']}")
 
 ---
 
-## ⚠️ 免责声明
+## 免责声明
 
 **重要提示**：本项目中的演示数据（包括但不限于"大树科技"、"常磊科技"等公司名称及相关财务、业务信息）均为 **Mock 编造数据**，仅用于技术演示和功能测试。
 
@@ -554,7 +554,7 @@ print(f"引用: {result['citations']}")
 
 ---
 
-## 🤝 贡献指南
+## 贡献指南
 
 欢迎提交 Issue 和 Pull Request！
 
@@ -566,13 +566,7 @@ print(f"引用: {result['citations']}")
 
 ---
 
-## 📄 许可证
-
-本项目采用 MIT 许可证。详情请参阅 [LICENSE](LICENSE) 文件。
-
----
-
-## 🙏 致谢
+## 致谢
 
 - [FastAPI](https://fastapi.tiangolo.com/) - 现代化的 Python Web 框架
 - [FAISS](https://github.com/facebookresearch/faiss) - Facebook AI Similarity Search
@@ -581,19 +575,14 @@ print(f"引用: {result['citations']}")
 
 ---
 
-## 📮 联系方式
+## 联系方式
 
 如有问题或建议，请通过以下方式联系：
-
-- 📧 Email: your-email@example.com
-- 🐛 Issues: [GitHub Issues](https://github.com/your-username/cursor-rag-system/issues)
-
+- Issues: [GitHub Issues](https://github.com/your-username/cursor-rag-system/issues)
 ---
 
 <div align="center">
 
 **⭐ 如果这个项目对你有帮助，请给个 Star！**
-
-Made with ❤️ by [Your Name]
 
 </div>

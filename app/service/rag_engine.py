@@ -3,6 +3,8 @@ RAG 核心服务
 协调检索引擎和 LLM 服务，实现完整的 RAG 流程
 """
 import hashlib
+import json
+import re
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -16,10 +18,39 @@ from app.llm import llm_service
 from app.config.config import yaml_config
 from app.pipeline.query import query_rewriter
 from app.retrieval.rrf import merge_with_rrf
+from app.router import intent_router
+from app.tools.calculator import CalculatorTool
 
 # 配置日志
 import logging
 logger = logging.getLogger(__name__)
+
+# CALC 意图：从参考资料中抽取数字并判断运算类型的系统提示
+CALC_EXTRACT_SYSTEM_PROMPT = """你是一个数据分析助手。请阅读提供的【参考资料】，提取回答【用户问题】所需的数字，并判断运算类型。
+
+输出格式要求：请仅输出一个 JSON 字符串，包含以下字段：
+- op_type: "growth" | "diff" | "ratio" | "none"  （growth=增长率，diff=差值，ratio=占比；无法从资料中得到可计算数字时填 "none"）
+- val1: 数字1（新值/分子/被减数）
+- val2: 数字2（旧值/分母/减数）
+- reason: 简短的理由
+
+若无法从资料中提取出两个可参与计算的数字，则 op_type 填 "none"，val1/val2 可填 0。"""
+
+# CALC 意图：根据计算结果与参考资料生成最终自然语言答案的系统提示
+CALC_SYNTHESIS_SYSTEM_PROMPT = """你是一个问答助手。请根据【参考资料】和【计算结果】生成对用户问题的自然语言回答。
+
+硬性要求：最终答案中必须包含计算公式（formula）的完整内容，不可省略。"""
+
+# SUMMARY 意图：结构化总结报告的系统提示
+SUMMARY_SYSTEM_PROMPT = """你是一名财务分析师。请根据【参考资料】生成结构化总结报告，用于回答用户的总结类问题。
+
+报告须包含以下部分（可据资料适当精简）：
+1. 基本情况
+2. 财务指标
+3. 亮点
+4. 风险
+
+硬性要求：每个关键结论或数据必须标注来源，使用 [Chunk ID] 格式引用，例如 [Chunk 123]。不得编造资料中未出现的信息。"""
 
 
 class RAGService:
@@ -100,6 +131,156 @@ class RAGService:
             }
             for chunk in chunks
         ]
+
+    def _build_context_from_chunks(self, chunks_data: List[Dict[str, Any]]) -> str:
+        """将 chunk 列表格式化为带 [Chunk ID] 的上下文字符串"""
+        return "\n\n".join(
+            f"[Chunk {chunk['id']}]\n{chunk.get('content', '')}"
+            for chunk in chunks_data
+        )
+
+    @staticmethod
+    def _extract_json_from_llm(text: str) -> Optional[Dict[str, Any]]:
+        """从 LLM 输出中提取 JSON（允许被 ```json ... ``` 包裹）"""
+        if not text or not text.strip():
+            return None
+        text = text.strip()
+        # 去掉 ```json ... ``` 或 ``` ... ```
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if m:
+            text = m.group(1).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # 尝试直接整段解析
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+    async def _handle_calc_logic(
+        self,
+        query: str,
+        context: str,
+        request_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        CALC 意图：从上下文中抽取数字、判断运算类型并执行计算。
+
+        Returns:
+            - fallback=True: 应退回到普通 RAG 回答（op_type 为 none 或解析/计算失败）
+            - fallback=False: 已得到有效计算，含 result、formula、reason 等，供后续合成答案
+        """
+        user_message = f"""【参考资料】\n{context}\n\n【用户问题】\n{query}"""
+        messages = [
+            {"role": "system", "content": CALC_EXTRACT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        try:
+            response = await llm_service.chat_completion(
+                messages=messages,
+                stream=False,
+                temperature=0.0,
+                max_tokens=512,
+                request_id=request_id,
+            )
+            raw = (
+                response.choices[0].message.content
+                if response.choices and response.choices[0].message
+                else ""
+            )
+        except Exception as e:
+            logger.warning("CALC 抽取 LLM 调用失败，退回到普通 RAG: %s", e)
+            return {"fallback": True}
+
+        data = self._extract_json_from_llm(raw)
+        if not data:
+            logger.warning("CALC 无法解析 LLM 输出的 JSON，退回普通 RAG。原始: %s", raw[:200])
+            return {"fallback": True}
+
+        op_type = (data.get("op_type") or "").strip().lower()
+        if op_type == "none":
+            return {"fallback": True}
+
+        if op_type not in ("growth", "diff", "ratio"):
+            logger.warning("CALC op_type 非法或为 none: %s，退回普通 RAG", op_type)
+            return {"fallback": True}
+
+        try:
+            val1 = float(data.get("val1", 0))
+            val2 = float(data.get("val2", 0))
+        except (TypeError, ValueError):
+            logger.warning("CALC val1/val2 无法转为数字，退回普通 RAG。data=%s", data)
+            return {"fallback": True}
+
+        calc = CalculatorTool().exec(op_type, val1, val2)
+        return {
+            "fallback": False,
+            "op_type": op_type,
+            "result": calc.get("result"),
+            "formula": calc.get("formula", ""),
+            "reason": data.get("reason", ""),
+        }
+
+    async def _synthesize_calc_answer(
+        self,
+        query: str,
+        context: str,
+        result: Any,
+        formula: str,
+        request_id: Optional[int] = None,
+    ) -> tuple[str, str]:
+        """根据计算结果与上下文，调用 LLM 生成包含公式的最终自然语言答案。返回 (answer, model_name)。"""
+        result_str = str(result) if result is not None else "（计算未得到数值，见公式说明）"
+        user_message = f"""【参考资料】\n{context}\n\n【计算结果】\nresult = {result_str}\nformula = {formula}\n\n【用户问题】\n{query}\n\n请生成回答，并在回答中完整包含上述 formula。"""
+        messages = [
+            {"role": "system", "content": CALC_SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        response = await llm_service.chat_completion(
+            messages=messages,
+            stream=False,
+            temperature=0.3,
+            max_tokens=1024,
+            request_id=request_id,
+        )
+        answer = (
+            response.choices[0].message.content
+            if response.choices and response.choices[0].message
+            else ""
+        )
+        model_name = getattr(response, "model", None) or "unknown"
+        # 若模型未包含 formula，则强制追加
+        if formula and formula.strip() and formula not in answer:
+            answer = answer.rstrip() + "\n\n计算公式：" + formula
+        return answer.strip(), model_name
+
+    async def _handle_summary_logic(
+        self,
+        query: str,
+        context: str,
+        request_id: Optional[int] = None,
+    ) -> tuple[str, str]:
+        """SUMMARY 意图：基于上下文生成结构化总结报告。返回 (answer, model_name)。"""
+        user_message = f"""【参考资料】\n{context}\n\n【用户问题】\n{query}"""
+        messages = [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        response = await llm_service.chat_completion(
+            messages=messages,
+            stream=False,
+            temperature=0.3,
+            max_tokens=2048,
+            request_id=request_id,
+        )
+        answer = (
+            response.choices[0].message.content
+            if response.choices and response.choices[0].message
+            else ""
+        )
+        model_name = getattr(response, "model", None) or "unknown"
+        return answer.strip(), model_name
     
     async def save_citations(
         self,
@@ -296,20 +477,51 @@ class RAGService:
                 )
             
             # 5. 上下文构建：将检索到的片段格式化为带 [Chunk ID] 的文本块
-            # （LLMService.generate_answer 内部会处理格式）
+            context_text = self._build_context_from_chunks(chunks_data)
             
-            # 6. LLM 生成：调用 LLMService.generate_answer
-            llm_result = await llm_service.generate_answer(
-                query=query,
-                context_chunks=chunks_data,
-                request_id=request_id
-            )
-            
-            answer = llm_result.get('answer', '')
-            confidence = llm_result.get('confidence', 0.0)
-            is_refused = llm_result.get('is_refused', False)
-            model_name = llm_result.get('model_name', 'unknown')
-            extracted_chunk_ids = llm_result.get('chunk_ids', [])
+            # 6. 意图识别：CALC 时走计算+合成，否则走普通 RAG 生成
+            intent = await intent_router.get_intent(query)
+            answer = None
+            extracted_chunk_ids = list(chunk_ids)
+
+            if intent == "CALC":
+                calc_out = await self._handle_calc_logic(
+                    query=query,
+                    context=context_text,
+                    request_id=request_id,
+                )
+                if not calc_out.get("fallback"):
+                    # 执行计算并合成最终答案（答案中必须包含 formula）
+                    answer, model_name = await self._synthesize_calc_answer(
+                        query=query,
+                        context=context_text,
+                        result=calc_out.get("result"),
+                        formula=calc_out.get("formula", ""),
+                        request_id=request_id,
+                    )
+                    confidence = 0.85
+                    is_refused = False
+            elif intent == "SUMMARY":
+                answer, model_name = await self._handle_summary_logic(
+                    query=query,
+                    context=context_text,
+                    request_id=request_id,
+                )
+                confidence = 0.9
+                is_refused = False
+
+            if answer is None:
+                # 普通 RAG 或 CALC 退回到普通 RAG
+                llm_result = await llm_service.generate_answer(
+                    query=query,
+                    context_chunks=chunks_data,
+                    request_id=request_id
+                )
+                answer = llm_result.get('answer', '')
+                confidence = llm_result.get('confidence', 0.0)
+                is_refused = llm_result.get('is_refused', False)
+                model_name = llm_result.get('model_name', 'unknown')
+                extracted_chunk_ids = llm_result.get('chunk_ids', [])
             
             # 7. 存入引用表：将模型实际引用的 chunk_ids 存入 qa_citations 表
             async with db_manager.get_session() as session:
