@@ -252,6 +252,7 @@ class RAGService:
                 }
                 for c in chunks_data
             ]
+            # 引用只发送一次，不随每个 token 重复，减少 SSE 流量与前端解析压力
             yield {"event": "citations", "data": citations}
 
             answer = None

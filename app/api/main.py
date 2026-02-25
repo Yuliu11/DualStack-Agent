@@ -373,7 +373,7 @@ def _sse_line(payload: dict) -> bytes:
 
 
 async def _chat_stream_generator(request: ChatRequest):
-    """异步生成器：按 Token 流式输出，零阻塞。每块为 data: {\"answer\": \"token内容\"}\\n\\n"""
+    """异步生成器：按 Token 流式输出，零阻塞。citations 仅首包发送一次，不随每个 token 重复，减少 JSON 流量。"""
     token_count = 0
     try:
         # 立即发送一个 SSE 注释，让响应头与首包尽快发出，避免客户端长时间等不到首字节

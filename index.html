@@ -181,11 +181,15 @@
             border: 1px solid #e0e0e0;
             border-bottom-left-radius: 4px;
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+            /* 流式输出时减少子节点变化触发的整页重排 */
+            contain: content;
         }
         
         .message-text {
             font-size: 14px;
             white-space: pre-wrap;
+            /* 流式长文本：限制布局影响范围，减轻重绘 */
+            contain: layout style;
         }
         
         .citations {
@@ -510,25 +514,30 @@
                         let chunkCount = 0;
                         let eventCount = 0;
                         const DEBUG_STREAM = true;
-                        const THROTTLE_MS = 80;
+                        const THROTTLE_MS = 90; // 每 80–100ms 更新一次 UI，降低重绘频率
 
-                        // 节流：累积 token，定时批量写入，避免每个 token 触发一次全量更新
+                        // 节流：buffer 机制，不按每个 SSE 包更新 UI，由定时器统一刷新
                         let pendingContent = '';
-                        let flushTimer = null;
+                        let throttleIntervalId = null;
                         const self = this;
                         function flushContent() {
                             if (!pendingContent) return;
                             assistantMessage.content += pendingContent;
                             pendingContent = '';
+                            // 若接入 Markdown：建议只对本次增量做解析/差分更新，避免整段重解析导致卡顿
                             self.scrollToBottom();
                         }
-                        // 当前为纯文本展示，无 marked/markdown-it，无深度 Markdown 重绘
-                        function scheduleFlush() {
-                            if (flushTimer != null) return;
-                            flushTimer = setTimeout(function () {
-                                flushTimer = null;
+                        function startThrottleInterval() {
+                            if (throttleIntervalId != null) return;
+                            throttleIntervalId = setInterval(function () {
                                 flushContent();
                             }, THROTTLE_MS);
+                        }
+                        function stopThrottleInterval() {
+                            if (throttleIntervalId != null) {
+                                clearInterval(throttleIntervalId);
+                                throttleIntervalId = null;
+                            }
                         }
 
                         let loadingCleared = false;
@@ -547,8 +556,7 @@
                             try {
                                 const data = JSON.parse(payload);
                                 if (data.error === true) {
-                                    if (flushTimer) clearTimeout(flushTimer);
-                                    flushTimer = null;
+                                    stopThrottleInterval();
                                     pendingContent = '';
                                     assistantMessage.content = data.message || '请求出错，请稍后重试。';
                                     ElMessage.error(data.message || '请求出错');
@@ -576,7 +584,7 @@
                                     }
                                     pendingContent += data.answer;
                                     clearLoadingOnce();
-                                    scheduleFlush();
+                                    startThrottleInterval();
                                 }
                             } catch (e) {
                                 if (payload !== '[DONE]') console.warn('SSE parse:', e);
@@ -608,8 +616,7 @@
                             if (dataLine) processSSEEvent.call(this, dataLine.trimStart());
                         }
                         
-                        if (flushTimer) clearTimeout(flushTimer);
-                        flushTimer = null;
+                        stopThrottleInterval();
                         flushContent();
                         if (DEBUG_STREAM) console.log('[STREAM] done. chunks=' + chunkCount + ', answer_events=' + eventCount + ', content_len=' + (assistantMessage.content ? assistantMessage.content.length : 0));
                         if (!assistantMessage.content) {
@@ -633,7 +640,13 @@
                         self._scrollRafId = null;
                         self.$nextTick(() => {
                             const container = self.$refs.messagesContainer;
-                            if (container) container.scrollTop = container.scrollHeight;
+                            if (!container) return;
+                            // 仅当用户已在底部时才自动滚动，避免打断阅读
+                            const threshold = 80;
+                            const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+                            if (atBottom) {
+                                container.scrollTop = container.scrollHeight; // 使用赋值即 behavior: 'auto'，无 smooth 计算开销
+                            }
                         });
                     });
                 },
