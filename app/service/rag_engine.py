@@ -17,9 +17,15 @@ from app.storage.db_manager import db_manager
 from app.storage.models import QARequest, QACitation, Chunk
 from app.llm import llm_service
 from app.config.config import yaml_config
-from app.pipeline.query import query_rewriter
+from app.pipeline.query import query_rewriter, slot_extractor
 from app.retrieval.rrf import merge_with_rrf
 from app.router import intent_router
+from app.schema.slots import (
+    get_slots_for_intent,
+    get_required_slot_names,
+    get_question_for_slot,
+)
+from app.service import session_manager
 from app.tools.calculator import CalculatorTool
 
 # 配置日志
@@ -152,27 +158,26 @@ class RAGService:
         tenant_id: int = 0,
         user_id: Optional[int] = None,
         top_k: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         流式问答：先 yield 引用来源（citations），再逐块 yield 答案内容。
-        若幂等缓存中已有 SUCCESS 结果，则直接 yield 该结果（先 citations 再 answer）；新请求走正常流式生成。
+        若意图需槽位且必填未齐，则 yield slot_asking 并中断，不执行检索。
         """
         task_id = self._make_task_id(user_id, query)
-        async with request_cache_lock:
-            entry = request_cache.get(task_id)
-            if entry and entry.get("status") == STATUS_SUCCESS:
-                logger.info(
-                    "[Idempotency] Hit cache for task_id: %s, skipping execution.",
-                    task_id,
-                )
-                result = entry.get("result") or {}
-                yield {"event": "citations", "data": result.get("citations", [])}
-                yield {"event": "answer", "data": result.get("answer", "")}
-                return
-            if entry and entry.get("status") == STATUS_PENDING:
-                yield {"event": "pending", "data": "请求正在处理中，请稍候"}
-                return
-            request_cache[task_id] = {"status": STATUS_PENDING, "result": None}
+        # 测试环境下可注释掉幂等检查，避免损坏/失败结果被缓存后直接返回，导致第一轮就出结果
+        # async with request_cache_lock:
+        #     entry = request_cache.get(task_id)
+        #     if entry and entry.get("status") == STATUS_SUCCESS:
+        #         logger.info("[Idempotency] Hit cache for task_id: %s, skipping execution.", task_id)
+        #         result = entry.get("result") or {}
+        #         yield {"event": "citations", "data": result.get("citations", [])}
+        #         yield {"event": "answer", "data": result.get("answer", "")}
+        #         return
+        #     if entry and entry.get("status") == STATUS_PENDING:
+        #         yield {"event": "pending", "data": "请求正在处理中，请稍候"}
+        #         return
+        #     request_cache[task_id] = {"status": STATUS_PENDING, "result": None}
 
         start_time = time.time()
         request_id = None
@@ -183,6 +188,41 @@ class RAGService:
                 )
                 request_id = qa_request.id
                 await session.commit()
+
+            # ---------- 动态槽位：意图 -> 所需槽位 -> 抽取 -> 合并 -> 判定 ----------
+            intent = await intent_router.get_intent(query)
+            print(f"--- [DEBUG] Final Intent: {intent} ---")
+            slot_config = get_slots_for_intent(intent)
+            all_slot_names = [s["name"] for s in slot_config]
+            print(f"--- [DEBUG] Target Slots for this intent: {all_slot_names} ---")
+            if all_slot_names:
+                extracted = await slot_extractor.extract(query, all_slot_names)
+                print(f"--- [DEBUG] Raw Slots Extracted: {extracted} ---")
+                merged = await session_manager.merge_slots(
+                    session_id, extracted, intent
+                )
+                if merged.get("department") and not merged.get("dept"):
+                    merged["dept"] = merged["department"]
+                if merged.get("date") and not merged.get("year"):
+                    merged["year"] = merged["date"]
+                print(f"--- [DEBUG] Combined Session Slots: {merged} ---")
+                required = get_required_slot_names(intent)
+                missing = [r for r in required if not merged.get(r)]
+                print(f"--- [DEBUG] Decision: {'Asking for more slots' if missing else 'Proceeding to RAG'} ---")
+                if missing:
+                    first_missing = missing[0]
+                    message = get_question_for_slot(intent, first_missing)
+                    # async with request_cache_lock:
+                    #     request_cache.pop(task_id, None)
+                    yield {
+                        "event": "slot_asking",
+                        "data": {
+                            "type": "slot_asking",
+                            "message": message,
+                            "missing_slots": missing,
+                        },
+                    }
+                    return
 
             rewrite_result = await query_rewriter.rewrite_query(
                 query=query, conversation_history=None, tenant_id=tenant_id
@@ -240,7 +280,7 @@ class RAGService:
                     session, chunk_ids, tenant_id
                 )
             context_text = self._build_context_from_chunks(chunks_data)
-            intent = await intent_router.get_intent(query)
+            # intent 已在槽位流程前取得，此处直接复用
 
             citations = [
                 {

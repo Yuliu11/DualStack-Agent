@@ -1,6 +1,7 @@
 """
 查询扩写/改写模块
-实现 Query Rewriter 功能，包括上下文补全、关键词扩展、多维度重写
+实现 Query Rewriter 功能，包括上下文补全、关键词扩展、多维度重写；
+以及 SlotExtractor 槽位抽取（LLM 解析用户输入为 JSON 槽位）。
 """
 import logging
 import json
@@ -10,6 +11,71 @@ from app.config.config import yaml_config, prompt_config
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+# ---------- 槽位抽取 ----------
+SLOT_EXTRACT_SYSTEM = """你是一个槽位抽取器。根据用户当前输入，提取指定槽位的值。
+只输出一个 JSON 对象，键为槽位名，值为从用户输入中识别出的字符串（无则省略该键或值为空字符串）。
+不要输出任何解释、换行或 markdown 标记，仅输出 JSON。"""
+
+
+class SlotExtractor:
+    """使用 LLM 将用户当前输入解析为 JSON 格式的槽位信息。"""
+
+    def __init__(self, llm_service_instance=None):
+        self._llm = llm_service_instance if llm_service_instance is not None else llm_service
+
+    async def extract(self, query: str, slot_names: List[str]) -> Dict[str, str]:
+        """
+        从用户输入中抽取指定槽位的值。
+
+        Args:
+            query: 用户当前输入
+            slot_names: 需要抽取的槽位名称列表，如 ["product", "date"]
+
+        Returns:
+            槽位名 -> 抽取值的字典；未识别或空的槽位不包含或值为空字符串。
+        """
+        if not slot_names:
+            return {}
+        slots_str = "、".join(slot_names)
+        user_prompt = f"槽位名列表：{slots_str}\n\n用户输入：{query.strip()}"
+        messages = [
+            {"role": "system", "content": SLOT_EXTRACT_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            response = await self._llm.chat_completion(
+                messages=messages,
+                stream=False,
+                temperature=0.0,
+                max_tokens=256,
+            )
+            raw = (
+                response.choices[0].message.content
+                if response.choices and response.choices[0].message
+                else ""
+            )
+            raw = raw.strip()
+            if not raw:
+                return {}
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.lower().startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {}
+            result = {}
+            for k in slot_names:
+                v = data.get(k)
+                if v is not None and str(v).strip():
+                    result[k] = str(v).strip()
+            return result
+        except Exception as e:
+            logger.warning("[SlotExtractor] 解析失败: %s", e)
+            return {}
 
 
 class QueryRewriter:
@@ -312,3 +378,4 @@ class QueryRewriter:
 
 # 创建全局单例
 query_rewriter = QueryRewriter()
+slot_extractor = SlotExtractor()

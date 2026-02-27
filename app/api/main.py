@@ -78,6 +78,7 @@ class ChatRequest(BaseModel):
     tenant_id: int = Field(default=0, description="租户ID")
     user_id: Optional[int] = Field(default=None, description="用户ID")
     top_k: Optional[int] = Field(default=5, description="检索返回的 Top-K 数量", ge=1, le=20)
+    session_id: Optional[str] = Field(default=None, description="会话 ID，用于槽位填充等多轮状态")
 
 
 class ChatResponse(BaseModel):
@@ -384,6 +385,7 @@ async def _chat_stream_generator(request: ChatRequest):
             tenant_id=request.tenant_id,
             user_id=request.user_id,
             top_k=request.top_k,
+            session_id=request.session_id,
         ):
             event = item.get("event", "message")
             raw = item.get("data")
@@ -393,10 +395,19 @@ async def _chat_stream_generator(request: ChatRequest):
                 token_count += 1
                 if token_count <= 3 or token_count % 20 == 0:
                     logger.info("[STREAM] yield token #%s", token_count)
+            elif event == "slot_asking":
+                logger.info("[STREAM] yield slot_asking (补槽阶段)")
 
             if event == "citations":
                 citations = raw if isinstance(raw, list) else (raw if raw is not None else [])
                 yield _sse_line({"citations": citations})
+            elif event == "slot_asking":
+                payload = raw if isinstance(raw, dict) else {}
+                # 严格保证前端收到的 JSON 包含 type: "slot_asking"
+                out = {"type": "slot_asking", **payload}
+                if "type" not in out or out.get("type") != "slot_asking":
+                    out["type"] = "slot_asking"
+                yield _sse_line(out)
             elif event == "error":
                 msg = raw if isinstance(raw, str) else (str(raw) if raw is not None else "")
                 yield _sse_line({"error": True, "message": msg})

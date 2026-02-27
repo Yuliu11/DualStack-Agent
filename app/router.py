@@ -52,18 +52,26 @@ class IntentRouter:
                 return intent  # type: ignore
         return "FACT"
 
+    # 预设关键词：命中则直接返回对应意图，避免“查询报表”等被误判为 FACT
+    SUMMARY_KEYWORDS = ("报表", "总结", "汇总", "概括", "核心观点", "主要内容", "奋斗", "查询报表", "财务报表")
+    CALC_KEYWORDS = ("增长", "同期", "比例", "谁更多", "差值", "计算", "同比", "环比")
+
     async def get_intent(self, query: str) -> IntentType:
         """
         根据用户查询获取意图类型。
-
-        Args:
-            query: 用户输入的问题文本
-
-        Returns:
-            "FACT" | "CALC" | "SUMMARY"；若 LLM 返回无法解析的内容则默认返回 "FACT"。
+        先走预设关键词匹配（报表/总结->SUMMARY，计算/增长->CALC），再走 LLM。
         """
         if not (query and query.strip()):
             return "FACT"
+        q = query.strip()
+        for kw in self.SUMMARY_KEYWORDS:
+            if kw in q:
+                logger.debug("意图预设命中 SUMMARY: 关键词 %s", kw)
+                return "SUMMARY"
+        for kw in self.CALC_KEYWORDS:
+            if kw in q:
+                logger.debug("意图预设命中 CALC: 关键词 %s", kw)
+                return "CALC"
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
