@@ -266,7 +266,15 @@ class PDFParser:
             and last_table_header is not None
             and len(last_table_header) > 0
         ):
-            # 将当前第一行归入 data，表头用 last_table_header；若列数不一致则按 last_table_header 列数截断/补齐
+            # 列数匹配检查：只有当前表格列数与 last_table_header 完全一致时才注入，否则视为新表格并清空 last_table_header
+            current_cols = len(first_row)
+            header_cols = len(last_table_header)
+            if current_cols != header_cols:
+                logger.info(
+                    "[表头] 页 %d 列数不一致（当前 %d vs 上次表头 %d），视为新表格并清空 last_table_header",
+                    page_no, current_cols, header_cols,
+                )
+                return table_data, None
             injected_header = list(last_table_header)
             new_data = [list(first_row)] + data
             col_count = len(injected_header)
@@ -289,9 +297,17 @@ class PDFParser:
         
         # 其他：页面顶部无表格或非续表，若有 last_table_header 且当前无有效表头也可注入（保证 chunk 带表头）
         if last_table_header and (not header or not self._is_header_like(header)):
-            injected_header = list(last_table_header)
             all_rows = (header if header else []) + data
             if all_rows:
+                current_cols = len(all_rows[0])
+                header_cols = len(last_table_header)
+                if current_cols != header_cols:
+                    logger.debug(
+                        "[表头] 页 %d 无表头但列数不一致（当前 %d vs 上次 %d），清空 last_table_header",
+                        page_no, current_cols, header_cols,
+                    )
+                    return table_data, None
+                injected_header = list(last_table_header)
                 col_count = len(injected_header)
                 new_data = [
                     (list(row) + [""] * (col_count - len(row)))[:col_count]
